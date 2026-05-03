@@ -31,7 +31,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import subprocess
 import threading
 import time
@@ -42,7 +41,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from parkview_codeparse import analyze, github, manifest, source, walker
+from parkview_codeparse import analyze, manifest, providers, source, walker
 from parkview_codeparse.config import DEFAULT_MAX_PARTIAL_CLONE_BYTES, JOB_HISTORY_MAX
 
 log = logging.getLogger(__name__)
@@ -190,28 +189,35 @@ def stats() -> dict[str, Any]:
 # Internals
 
 
-def _maybe_fetch_github_sizes(
+def _maybe_fetch_provider_sizes(
     src_arg: str,
     git_ref: str,
     options: dict[str, Any],
     log_fh: Any,
 ) -> dict[str, int] | None:
-    """Best-effort GitHub Trees API pre-flight. Returns None on any failure."""
-    if not options.get("github_api", True):
+    """Best-effort provider pre-flight (GitHub Trees API or GitLab
+    REST tree + GraphQL).
+
+    Returns `{path: size}` for every blob, or None on any failure (rate
+    limit, network error, 4xx, truncated). On None, the caller falls
+    back to the single-clone path with `size=-1` for unfetched files.
+    """
+    if not options.get("provider_api", True):
         return None
-    parsed = github.parse_github_url(src_arg)
-    if parsed is None:
+    matched = providers.for_url(src_arg)
+    if matched is None:
         return None
-    owner, repo_name = parsed
-    token = os.environ.get("GITHUB_TOKEN") or None
-    sizes = github.fetch_blob_sizes(owner, repo_name, git_ref=git_ref, token=token)
+    provider, owner, repo_name = matched
+    token = provider.env_token()
+    sizes = provider.fetch_blob_sizes(owner, repo_name, git_ref=git_ref, token=token)
     if sizes is None:
-        _emit(log_fh, {"event": "github_trees_api_unavailable"})
+        _emit(log_fh, {"event": "provider_api_unavailable", "provider": provider.NAME})
         return None
     _emit(
         log_fh,
         {
-            "event": "github_trees_api_ok",
+            "event": "provider_api_ok",
+            "provider": provider.NAME,
             "n_paths": len(sizes),
             "authenticated": bool(token),
         },
@@ -233,24 +239,26 @@ def _run_one_of(
     """Pick a fetch strategy and run it.
 
     1. Local path → walk on disk, no clone, no network.
-    2. GitHub URL + Trees API succeeded + planned bytes > threshold →
-       streaming bin-packed mode (no clone; download files in batches
-       of <= max_partial_clone_bytes via raw URLs, analyze, delete).
-    3. Everything else (including Trees-API-failed GitHub) → single
+    2. Provider URL (GitHub or GitLab) + provider API succeeded +
+       planned bytes > threshold → streaming bin-packed mode (no
+       clone; download files in batches of <= max_partial_clone_bytes
+       via the provider's raw URLs, analyze, delete).
+    3. Everything else (including provider-API-failed) → single
        partial clone via `git clone --filter=blob:limit=<max_file_bytes>`.
 
     Returns the WalkResult (for the manifest's tree.json) and the per-
     file summaries (for the rest of the manifest).
     """
-    parsed_gh = github.parse_github_url(src_arg)
+    matched = providers.for_url(src_arg)
 
-    if parsed_gh and size_overrides is not None:
+    if matched is not None and size_overrides is not None:
+        provider, owner, repo_name = matched
         planned = _planned_source_bytes(size_overrides, options)
         cap = options["max_partial_clone_bytes"]
         if planned > cap and not options["eager_clone"]:
-            owner, repo_name = parsed_gh
             return _run_streaming(
                 job_id=job_id,
+                provider=provider,
                 owner=owner,
                 repo_name=repo_name,
                 git_ref=git_ref,
@@ -326,6 +334,7 @@ def _run_single_clone(
 def _run_streaming(
     *,
     job_id: str,
+    provider: Any,
     owner: str,
     repo_name: str,
     git_ref: str,
@@ -336,16 +345,16 @@ def _run_streaming(
     sizes: dict[str, int],
 ) -> tuple[walker.WalkResult, list[dict[str, Any]]]:
     """Streaming mode: no clone. Bin-pack source files into batches of
-    <= max_partial_clone_bytes, fetch each batch via raw URLs, analyze,
-    delete the batch, repeat.
+    <= max_partial_clone_bytes, fetch each batch via the provider's raw
+    URLs, analyze, delete the batch, repeat.
 
     Peak source-side disk = one batch's bytes.
     """
-    token = os.environ.get("GITHUB_TOKEN") or None
+    token = provider.env_token()
     ref = git_ref
     if not ref:
-        # Trees API gave us sizes; we still need a ref string for raw URLs.
-        ref = github.fetch_default_branch(owner, repo_name, token=token) or "HEAD"
+        # Provider API gave us sizes; we still need a ref string for raw URLs.
+        ref = provider.fetch_default_branch(owner, repo_name, token=token) or "HEAD"
 
     scratch = output_dir / ".source"
     if scratch.exists():
@@ -356,7 +365,7 @@ def _run_streaming(
     # apply the same filter the local-mode walker does.
     gitignore_text = ""
     if options["respect_gitignore"]:
-        gi = github.fetch_blob_via_raw(owner, repo_name, ref, ".gitignore", token=token)
+        gi = provider.fetch_blob_via_raw(owner, repo_name, ref, ".gitignore", token=token)
         if gi is not None:
             gitignore_text = gi.decode("utf-8", errors="replace")
 
@@ -389,6 +398,7 @@ def _run_streaming(
 
     file_summaries = _process_streaming_batches(
         job_id=job_id,
+        provider=provider,
         owner=owner,
         repo_name=repo_name,
         ref=ref,
@@ -443,6 +453,7 @@ def _bin_pack(entries: list[walker.TreeEntry], limit: int) -> list[list[walker.T
 def _process_streaming_batches(
     *,
     job_id: str,
+    provider: Any,
     owner: str,
     repo_name: str,
     ref: str,
@@ -479,6 +490,7 @@ def _process_streaming_batches(
             )
 
             fetched = _fetch_batch(
+                provider=provider,
                 owner=owner,
                 repo_name=repo_name,
                 ref=ref,
@@ -521,6 +533,7 @@ def _process_streaming_batches(
 
 def _fetch_batch(
     *,
+    provider: Any,
     owner: str,
     repo_name: str,
     ref: str,
@@ -529,7 +542,8 @@ def _fetch_batch(
     token: str | None,
     workers: int,
 ) -> set[str]:
-    """Fetch each file in `batch` to disk in parallel via raw URLs.
+    """Fetch each file in `batch` to disk in parallel via the provider's
+    raw URL helper.
 
     Returns the set of paths that landed on disk successfully. Failed
     fetches are silently dropped from the set; the caller decides how
@@ -539,7 +553,7 @@ def _fetch_batch(
     fetch_lock = threading.Lock()
 
     def _one(entry: walker.TreeEntry) -> None:
-        content = github.fetch_blob_via_raw(
+        content = provider.fetch_blob_via_raw(
             owner,
             repo_name,
             ref,
@@ -574,7 +588,10 @@ def _options_from_args(arguments: dict[str, Any]) -> dict[str, Any]:
         "include_chunks": bool(arguments.get("include_chunks", True)),
         "chunk_max_tokens": int(arguments.get("chunk_max_tokens", 800)),
         "eager_clone": bool(arguments.get("eager_clone", False)),
-        "github_api": bool(arguments.get("github_api", True)),
+        # `provider_api` is the new name; we accept the old `github_api`
+        # for back-compat. Either disables the pre-flight call to the
+        # provider's tree/sizes endpoint.
+        "provider_api": bool(arguments.get("provider_api", arguments.get("github_api", True))),
         "max_partial_clone_bytes": int(
             arguments.get("max_partial_clone_bytes", DEFAULT_MAX_PARTIAL_CLONE_BYTES)
         ),
@@ -656,7 +673,7 @@ def _run_job(job_id: str) -> None:
             # of every blob in HEAD (one HTTP call, no blobs fetched).
             # Used both as input to the streaming-vs-single decision and
             # to fill in real sizes for unfetched files in tree.json.
-            size_overrides = _maybe_fetch_github_sizes(src_arg, git_ref, options, log_fh)
+            size_overrides = _maybe_fetch_provider_sizes(src_arg, git_ref, options, log_fh)
 
             walk_result, file_summaries = _run_one_of(
                 job_id=job_id,

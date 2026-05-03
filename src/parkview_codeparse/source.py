@@ -28,6 +28,11 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from parkview_codeparse import providers
+
+# Single-source-of-truth URL acceptance lives in `providers.for_url`.
+# We still keep this compiled regex around for `is_github_url` callers
+# in older code paths (test_source.py among them).
 GITHUB_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?(?:\.git)?$")
 GIT_REF = re.compile(r"^[A-Za-z0-9._/\-]{1,250}$")
 
@@ -69,6 +74,11 @@ class ResolvedSource:
 
 def is_github_url(source: str) -> bool:
     return GITHUB_URL.match(source) is not None
+
+
+def is_repo_url(source: str) -> bool:
+    """Any URL we recognize as a hosting provider (github.com, gitlab.com)."""
+    return providers.is_repo_url(source)
 
 
 def validate_output_dir(output_dir: str, *, force: bool) -> Path:
@@ -136,29 +146,26 @@ def resolve_source(
 ) -> ResolvedSource:
     """Materialize the source into a local directory we can walk.
 
-    For GitHub URLs (default `eager_clone=False`) we do a size-bounded
-    partial clone: `git clone --filter=blob:limit=<max_blob_bytes>
-    --depth=1`. Git then fetches every reachable blob whose size is
-    under the cap in a single transfer, and leaves blobs above the cap
-    missing on disk. The working tree is materialized normally for the
-    blobs we got. Net effect: source files come down (typically a few
-    MB total), big binaries / lockfiles / generated data files do not,
-    and we don't pay one network round-trip per file (which is what
-    `--filter=blob:none` + per-file checkout would force).
+    For provider-recognized URLs (GitHub or GitLab via `providers.for_url`)
+    we do a size-bounded partial clone — `git clone
+    --filter=blob:limit=<max_blob_bytes> --depth=1`. Git fetches every
+    reachable blob whose size is under the cap in a single transfer
+    and leaves blobs above the cap missing on disk. The working tree
+    is materialized normally for the blobs we got.
 
-    `--filter=blob:none` was tried and rejected: in partial-clone mode,
-    both `git checkout HEAD -- <path>` and `git cat-file --batch`
-    trigger a separate network fetch per missing blob, with no
-    bundling, which is ~25x slower than the size-bounded clone for
-    typical source repos.
+    Why size-bounded and not `blob:none`: in `blob:none` mode, both
+    `git checkout HEAD -- <path>` and `git cat-file --batch` trigger
+    a separate network fetch per missing blob, with no bundling,
+    making the alternative ~25x slower than the size-bounded clone
+    for typical source repos.
 
     With `eager_clone=True` we do the legacy `--depth=1` full clone
-    instead (no filter). Useful when callers know the repo is small
-    or want every blob locally for follow-up work.
+    (no filter). Useful when callers know the repo is small or want
+    every blob locally for follow-up work.
 
     For local paths we validate and return the path as-is.
     """
-    if is_github_url(source):
+    if is_repo_url(source):
         ref = validate_git_ref(git_ref)
         clone_dir = output_dir / ".source"
         if clone_dir.exists():
@@ -185,7 +192,7 @@ def resolve_source(
 
         return ResolvedSource(root=clone_dir)
 
-    # Anything that's not a recognized GitHub URL is treated as a local path.
+    # Anything that's not a recognized provider URL is treated as a local path.
     if "://" in source or source.startswith(("git@", "ssh://", "file://")):
         raise SourceError(f"unsupported source URL scheme: {source!r}")
     return ResolvedSource(root=validate_local_source(source))

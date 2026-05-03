@@ -101,7 +101,14 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Local directory path OR a GitHub URL (https://github.com/owner/repo).",
+                        "description": (
+                            "Local directory path, GitHub URL "
+                            "(https://github.com/owner/repo), or GitLab URL "
+                            "(https://gitlab.com/owner/repo, including nested "
+                            "groups like https://gitlab.com/group/sub/repo). "
+                            "Set GITHUB_TOKEN or GITLAB_TOKEN to authenticate "
+                            "and access private repos."
+                        ),
                     },
                     "output_dir": {
                         "type": "string",
@@ -109,7 +116,11 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "git_ref": {
                         "type": "string",
-                        "description": "Branch, tag, or sha to clone (GitHub sources only).",
+                        "description": (
+                            "Branch, tag, or sha to analyze. Applies to "
+                            "GitHub and GitLab sources; ignored for local "
+                            "paths. Defaults to the repo's default branch."
+                        ),
                         "default": "",
                     },
                     "force": {
@@ -142,16 +153,20 @@ async def list_tools() -> list[types.Tool]:
                             "every binary on big ones."
                         ),
                     },
-                    "github_api": {
+                    "provider_api": {
                         "type": "boolean",
                         "default": True,
                         "description": (
-                            "Optional pre-flight: hit the GitHub Trees API "
-                            "for accurate blob sizes (no blob fetches). Used "
-                            "to fill in real sizes for files we don't fetch. "
-                            "Silent fallback on rate-limit / failure. Set "
-                            "GITHUB_TOKEN env to authenticate (60/hr "
-                            "unauthenticated, 5000/hr with token)."
+                            "Optional pre-flight against the source's "
+                            "hosting provider (GitHub Trees REST or GitLab "
+                            "REST tree + GraphQL) to enumerate every blob "
+                            "with its size, without fetching contents. "
+                            "Drives the streaming / single-clone decision "
+                            "and fills in tree.json sizes for unfetched "
+                            "files. Silent fallback on rate-limit / failure. "
+                            "Set GITHUB_TOKEN or GITLAB_TOKEN to "
+                            "authenticate. Accepts the legacy `github_api` "
+                            "name for back-compat."
                         ),
                     },
                     "max_partial_clone_bytes": {

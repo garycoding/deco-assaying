@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from parkview_codeparse import github as github_provider
 from parkview_codeparse import jobs, walker
 
 # ---------------------------------------------------------------------------
@@ -166,9 +167,9 @@ def test_streaming_end_to_end_with_mocked_github(tmp_path: Path):
     out = tmp_path / "out"
 
     with (
-        patch.object(jobs.github, "fetch_blob_sizes", side_effect=_fake_blob_sizes),
-        patch.object(jobs.github, "fetch_default_branch", side_effect=_fake_default_branch),
-        patch.object(jobs.github, "fetch_blob_via_raw", side_effect=_fake_blob_via_raw),
+        patch.object(github_provider, "fetch_blob_sizes", side_effect=_fake_blob_sizes),
+        patch.object(github_provider, "fetch_default_branch", side_effect=_fake_default_branch),
+        patch.object(github_provider, "fetch_blob_via_raw", side_effect=_fake_blob_via_raw),
     ):
         job_id = jobs.start_index_repo(
             {
@@ -210,7 +211,7 @@ def test_streaming_end_to_end_with_mocked_github(tmp_path: Path):
     # log.jsonl recorded the streaming-mode events.
     log_events = [json.loads(ln) for ln in (out / "log.jsonl").read_text().splitlines() if ln.strip()]
     event_types = {e["event"] for e in log_events}
-    assert "github_trees_api_ok" in event_types
+    assert "provider_api_ok" in event_types
     assert "batches_planned" in event_types
     assert "batch_start" in event_types
     assert "batch_done" in event_types

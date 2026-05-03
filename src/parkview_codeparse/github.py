@@ -1,11 +1,9 @@
-"""GitHub Trees API helper.
+"""GitHub provider.
 
-Optional pre-flight that asks GitHub for `{path: size}` of every file
-in a repo's HEAD tree, in one HTTP call, without touching any blobs.
-We use it to fill in real sizes for files we deliberately don't fetch
-during a `--filter=blob:limit=N` partial clone — those would otherwise
-land in `tree.json` with `size: -1`, which is fine but a bit lossy if
-cobgrind wants to reason about how big the unfetched files are.
+Implements the provider protocol for github.com repos: URL parsing,
+blob-size enumeration via the REST Trees API (sizes are included on
+every blob entry, no second call needed), default-branch resolution,
+and one-file raw-content fetches via raw.githubusercontent.com.
 
 Failures are silent and non-fatal:
 
@@ -23,21 +21,34 @@ with `size: -1` for unfetched blobs.
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 
+NAME = "github"
+TOKEN_ENV = "GITHUB_TOKEN"
+
 GITHUB_REPO_URL = re.compile(r"^https://github\.com/([A-Za-z0-9_.\-]+)/([A-Za-z0-9_.\-]+?)(?:\.git)?$")
 _API_BASE = "https://api.github.com"
 
 
-def parse_github_url(url: str) -> tuple[str, str] | None:
+def env_token() -> str | None:
+    """Read the provider-specific token env var (`GITHUB_TOKEN`)."""
+    return os.environ.get(TOKEN_ENV) or None
+
+
+def parse_url(url: str) -> tuple[str, str] | None:
     """Extract `(owner, repo)` from a GitHub HTTPS URL, or None if not one."""
     m = GITHUB_REPO_URL.match(url)
     if not m:
         return None
     return m.group(1), m.group(2)
+
+
+# Back-compat alias; old name was provider-specific.
+parse_github_url = parse_url
 
 
 def fetch_blob_sizes(

@@ -22,8 +22,12 @@ The server listens on `PORT` (default `35832`) with:
 - `analyze_file(content, filename?, language?, options?)` — parse a single
   file passed inline; returns structural JSON.
 - `index_repo(source, output_dir, options?)` — start a job that indexes a
-  whole repo (local path or GitHub URL) and writes per-file artifacts plus a
-  manifest under `output_dir`. Returns `{ job_id }`.
+  whole repo and writes per-file artifacts plus a manifest under `output_dir`.
+  `source` can be a local directory, a GitHub URL
+  (`https://github.com/owner/repo`), or a GitLab URL
+  (`https://gitlab.com/owner/repo`, including nested groups
+  `https://gitlab.com/group/sub/repo`). Pass `git_ref` to pick a specific
+  branch / tag / sha. Returns `{ job_id }`.
 - `get_job_status(job_id)` — poll a running or completed job.
 - `cancel_job(job_id)` — cooperative cancel.
 - `list_supported_languages()` — capability discovery.
@@ -55,10 +59,11 @@ disk footprint regardless of how large the source repo is:
   `max_file_bytes` (default 2 MB), so worst case is ~16-32 MB of
   resident source + parse trees on a typical 8-core box.
 
-- **Network:** one GitHub Trees API call to plan the batches (free for
-  public repos, set `GITHUB_TOKEN` for the 5000-req/hr quota), plus
-  one `git fetch-pack` round-trip per batch. For a typical sub-100 MB
-  repo that's two HTTP hits total.
+- **Network:** one provider-API pre-flight to plan the batches (GitHub
+  Trees REST or GitLab REST tree + GraphQL; free for public repos, set
+  `GITHUB_TOKEN` / `GITLAB_TOKEN` for higher quotas and private-repo
+  access), plus one `git fetch-pack` round-trip per batch. For a
+  typical sub-100 MB repo that's two HTTP hits total.
 
 For local-path sources nothing is fetched and nothing is cloned —
 the only on-disk cost is the output artifacts.
@@ -72,7 +77,8 @@ the only on-disk cost is the output artifacts.
 | `JOB_HISTORY_MAX` | `100` | In-memory job-table cap. |
 | `DEFAULT_MAX_FILE_BYTES` | `2097152` | Default per-file size cap. |
 | `DEFAULT_CHUNK_MAX_TOKENS` | `800` | Default chunk size for cAST chunking. |
-| `GITHUB_TOKEN` | unset | Optional, raises Trees API quota from 60 to 5000 req/hr and unlocks private repos. |
+| `GITHUB_TOKEN` | unset | Optional, raises GitHub Trees API quota from 60 to 5000 req/hr and unlocks private repos. |
+| `GITLAB_TOKEN` | unset | Optional, used for GitLab API auth and private-repo access. |
 
 See `/Users/gary/.claude/plans/cobgrind-is-a-daemon-fluttering-sutton.md` for
 the full design.
