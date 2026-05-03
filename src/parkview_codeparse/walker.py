@@ -56,6 +56,75 @@ DEFAULT_DIR_SKIPS: frozenset[str] = frozenset(
 
 _SNIFF_BYTES = 8192
 
+# Extension blacklist used when we have to decide "is this binary?"
+# without any content — i.e. when planning a streaming fetch from the
+# Trees API output, where reading bytes would defeat the whole point.
+# In local / single-clone mode we still NUL-sniff (more accurate); this
+# list is the fallback for the streaming path.
+BINARY_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "ico",
+        "bmp",
+        "tiff",
+        "webp",
+        "avif",
+        "svg",
+        "pdf",
+        "ai",
+        "psd",
+        "sketch",
+        "zip",
+        "tar",
+        "gz",
+        "bz2",
+        "7z",
+        "rar",
+        "xz",
+        "tgz",
+        "tbz",
+        "zst",
+        "exe",
+        "dll",
+        "so",
+        "dylib",
+        "a",
+        "lib",
+        "o",
+        "obj",
+        "class",
+        "jar",
+        "war",
+        "wasm",
+        "pyc",
+        "pyd",
+        "whl",
+        "egg",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "eot",
+        "mp3",
+        "mp4",
+        "mov",
+        "avi",
+        "mkv",
+        "flac",
+        "wav",
+        "ogg",
+        "webm",
+        "m4a",
+        "m4v",
+        "iso",
+        "img",
+        "dmg",
+    }
+)
+
 
 @dataclass
 class TreeEntry:
@@ -146,6 +215,52 @@ def walk_full(
             reason = _file_skip_reason(rel, full, size, spec_root, extra_spec, max_file_bytes)
             entry = TreeEntry(path=rel, size=size, analyzed=(reason == ""), skip_reason=reason)
             (result.included if entry.analyzed else result.skipped).append(entry)
+    return result
+
+
+def walk_from_inventory(
+    sizes: dict[str, int],
+    *,
+    gitignore_text: str = "",
+    extra_ignore_globs: list[str] | None = None,
+    max_file_bytes: int = 2 * 1024 * 1024,
+) -> WalkResult:
+    """Build a `WalkResult` purely from a `{path: size}` inventory.
+
+    Used by the streaming-fetch path — we have the full repo listing
+    from the GitHub Trees API, so we can decide which files we'll
+    analyze without ever cloning anything. Filters applied:
+
+    - DEFAULT_DIR_SKIPS by path component (vendored / generated dirs).
+    - `.gitignore` patterns from `gitignore_text` (caller fetches it
+      via raw URL or similar; empty string disables the filter).
+    - `extra_ignore_globs` from the index_repo options.
+    - Size cap from `max_file_bytes` (sizes come straight from Trees API).
+    - Binary detection via `BINARY_EXTENSIONS` since we don't have
+      content to NUL-sniff.
+
+    Directory-level skips are silent (not recorded in tree.json).
+    Per-file skips become `WalkResult.skipped` entries with their reason.
+    """
+    spec_root = pathspec.GitIgnoreSpec.from_lines(gitignore_text.splitlines()) if gitignore_text else None
+    extra_spec = pathspec.GitIgnoreSpec.from_lines(extra_ignore_globs) if extra_ignore_globs else None
+    result = WalkResult()
+    for rel, size in sizes.items():
+        if any(part in DEFAULT_DIR_SKIPS for part in rel.split("/")[:-1]):
+            continue  # directory skip; don't list these in tree.json
+        reason = ""
+        if spec_root is not None and spec_root.match_file(rel):
+            reason = "gitignore"
+        elif extra_spec is not None and extra_spec.match_file(rel):
+            reason = "extra_ignore"
+        elif size > max_file_bytes:
+            reason = "oversize"
+        else:
+            name = rel.rsplit("/", 1)[-1].lower()
+            if "." in name and name.rsplit(".", 1)[1] in BINARY_EXTENSIONS:
+                reason = "binary"
+        entry = TreeEntry(path=rel, size=size, analyzed=(reason == ""), skip_reason=reason)
+        (result.included if entry.analyzed else result.skipped).append(entry)
     return result
 
 

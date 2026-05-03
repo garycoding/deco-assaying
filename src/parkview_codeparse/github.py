@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 GITHUB_REPO_URL = re.compile(r"^https://github\.com/([A-Za-z0-9_.\-]+)/([A-Za-z0-9_.\-]+?)(?:\.git)?$")
@@ -81,6 +82,54 @@ def fetch_blob_sizes(
             except (KeyError, TypeError, ValueError):
                 continue
     return out
+
+
+def fetch_default_branch(
+    owner: str,
+    repo: str,
+    *,
+    token: str | None = None,
+    timeout: float = 10.0,
+) -> str | None:
+    """Resolve the repo's default branch name (e.g. `main`, `trunk`)."""
+    info = _api_get(f"/repos/{owner}/{repo}", token=token, timeout=timeout)
+    if info is None:
+        return None
+    branch = info.get("default_branch")
+    return str(branch) if branch else None
+
+
+def fetch_blob_via_raw(
+    owner: str,
+    repo: str,
+    ref: str,
+    rel_path: str,
+    *,
+    token: str | None = None,
+    timeout: float = 60.0,
+) -> bytes | None:
+    """Fetch a single file's bytes from `raw.githubusercontent.com`.
+
+    `ref` may be a branch name, tag, or commit sha. Returns the raw
+    bytes on success or None on any error (network, timeout, 404).
+
+    raw.githubusercontent.com is served from a CDN and is not subject
+    to the 60/hr API rate limit; for authenticated requests it accepts
+    the same bearer token as the API.
+    """
+    # GitHub paths come in URL-safe form already, but %-encode anything
+    # that would be ambiguous in a URL path component.
+    encoded_path = urllib.parse.quote(rel_path, safe="/-._~")
+    url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{encoded_path}"
+    headers = {"User-Agent": "parkview-codeparse-server"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
 
 
 def _api_get(

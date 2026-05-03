@@ -154,6 +154,21 @@ async def list_tools() -> list[types.Tool]:
                             "unauthenticated, 5000/hr with token)."
                         ),
                     },
+                    "max_partial_clone_bytes": {
+                        "type": "integer",
+                        "default": 100 * 1024 * 1024,
+                        "description": (
+                            "Peak source-side scratch space during a "
+                            "GitHub-clone job. When the Trees API reports "
+                            "the planned source download exceeds this, we "
+                            "switch from a single partial clone to bin-"
+                            "packed streaming: each batch of files (totaling "
+                            "<= this many bytes) is fetched, analyzed, and "
+                            "deleted before the next batch arrives. Lets "
+                            "the server analyze multi-GB monorepos with "
+                            "bounded local disk."
+                        ),
+                    },
                     "include_chunks": {"type": "boolean", "default": True},
                     "chunk_max_tokens": {"type": "integer", "default": 800},
                 },

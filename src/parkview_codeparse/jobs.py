@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from parkview_codeparse import analyze, github, manifest, source, walker
-from parkview_codeparse.config import JOB_HISTORY_MAX
+from parkview_codeparse.config import DEFAULT_MAX_PARTIAL_CLONE_BYTES, JOB_HISTORY_MAX
 
 log = logging.getLogger(__name__)
 
@@ -219,6 +219,351 @@ def _maybe_fetch_github_sizes(
     return sizes
 
 
+def _run_one_of(
+    *,
+    job_id: str,
+    src_arg: str,
+    git_ref: str,
+    output_dir: Path,
+    files_dir: Path,
+    log_fh: Any,
+    options: dict[str, Any],
+    size_overrides: dict[str, int] | None,
+) -> tuple[walker.WalkResult, list[dict[str, Any]]]:
+    """Pick a fetch strategy and run it.
+
+    1. Local path → walk on disk, no clone, no network.
+    2. GitHub URL + Trees API succeeded + planned bytes > threshold →
+       streaming bin-packed mode (no clone; download files in batches
+       of <= max_partial_clone_bytes via raw URLs, analyze, delete).
+    3. Everything else (including Trees-API-failed GitHub) → single
+       partial clone via `git clone --filter=blob:limit=<max_file_bytes>`.
+
+    Returns the WalkResult (for the manifest's tree.json) and the per-
+    file summaries (for the rest of the manifest).
+    """
+    parsed_gh = github.parse_github_url(src_arg)
+
+    if parsed_gh and size_overrides is not None:
+        planned = _planned_source_bytes(size_overrides, options)
+        cap = options["max_partial_clone_bytes"]
+        if planned > cap and not options["eager_clone"]:
+            owner, repo_name = parsed_gh
+            return _run_streaming(
+                job_id=job_id,
+                owner=owner,
+                repo_name=repo_name,
+                git_ref=git_ref,
+                output_dir=output_dir,
+                files_dir=files_dir,
+                log_fh=log_fh,
+                options=options,
+                sizes=size_overrides,
+            )
+
+    # Single-clone (default for typical-sized repos and for local paths).
+    return _run_single_clone(
+        job_id=job_id,
+        src_arg=src_arg,
+        git_ref=git_ref,
+        output_dir=output_dir,
+        files_dir=files_dir,
+        log_fh=log_fh,
+        options=options,
+        size_overrides=size_overrides,
+    )
+
+
+def _run_single_clone(
+    *,
+    job_id: str,
+    src_arg: str,
+    git_ref: str,
+    output_dir: Path,
+    files_dir: Path,
+    log_fh: Any,
+    options: dict[str, Any],
+    size_overrides: dict[str, int] | None,
+) -> tuple[walker.WalkResult, list[dict[str, Any]]]:
+    """The original path: clone (or take a local dir), walk on disk, analyze."""
+    resolved = source.resolve_source(
+        source=src_arg,
+        output_dir=output_dir,
+        git_ref=git_ref,
+        max_blob_bytes=options["max_file_bytes"],
+        eager_clone=options["eager_clone"],
+    )
+    _emit(log_fh, {"event": "source_resolved", "root": str(resolved.root), "mode": "single"})
+
+    walk_result = walker.walk_full(
+        resolved.root,
+        respect_gitignore=options["respect_gitignore"],
+        extra_ignore_globs=options["extra_ignore_globs"],
+        max_file_bytes=options["max_file_bytes"],
+    )
+    walker.annotate_with_unfetched_blobs(
+        walk_result,
+        resolved.root,
+        size_overrides=size_overrides,
+    )
+    with _lock:
+        _jobs[job_id]["files_total"] = len(walk_result.included)
+    _emit(
+        log_fh,
+        {"event": "walk_done", "included": len(walk_result.included), "skipped": len(walk_result.skipped)},
+    )
+    file_summaries = _process_files(
+        job_id=job_id,
+        root=resolved.root,
+        entries=walk_result.included,
+        files_dir=files_dir,
+        log_fh=log_fh,
+        options=options,
+    )
+    return walk_result, file_summaries
+
+
+def _run_streaming(
+    *,
+    job_id: str,
+    owner: str,
+    repo_name: str,
+    git_ref: str,
+    output_dir: Path,
+    files_dir: Path,
+    log_fh: Any,
+    options: dict[str, Any],
+    sizes: dict[str, int],
+) -> tuple[walker.WalkResult, list[dict[str, Any]]]:
+    """Streaming mode: no clone. Bin-pack source files into batches of
+    <= max_partial_clone_bytes, fetch each batch via raw URLs, analyze,
+    delete the batch, repeat.
+
+    Peak source-side disk = one batch's bytes.
+    """
+    token = os.environ.get("GITHUB_TOKEN") or None
+    ref = git_ref
+    if not ref:
+        # Trees API gave us sizes; we still need a ref string for raw URLs.
+        ref = github.fetch_default_branch(owner, repo_name, token=token) or "HEAD"
+
+    scratch = output_dir / ".source"
+    if scratch.exists():
+        source._safe_clean(scratch)
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    # `.gitignore` content (best-effort) so the streaming walker can
+    # apply the same filter the local-mode walker does.
+    gitignore_text = ""
+    if options["respect_gitignore"]:
+        gi = github.fetch_blob_via_raw(owner, repo_name, ref, ".gitignore", token=token)
+        if gi is not None:
+            gitignore_text = gi.decode("utf-8", errors="replace")
+
+    walk_result = walker.walk_from_inventory(
+        sizes=sizes,
+        gitignore_text=gitignore_text,
+        extra_ignore_globs=options["extra_ignore_globs"],
+        max_file_bytes=options["max_file_bytes"],
+    )
+    with _lock:
+        _jobs[job_id]["files_total"] = len(walk_result.included)
+    _emit(
+        log_fh,
+        {
+            "event": "source_resolved",
+            "root": str(scratch),
+            "mode": "streaming",
+            "owner": owner,
+            "repo": repo_name,
+            "ref": ref,
+        },
+    )
+    _emit(
+        log_fh,
+        {"event": "walk_done", "included": len(walk_result.included), "skipped": len(walk_result.skipped)},
+    )
+
+    batches = _bin_pack(walk_result.included, options["max_partial_clone_bytes"])
+    _emit(log_fh, {"event": "batches_planned", "batch_count": len(batches)})
+
+    file_summaries = _process_streaming_batches(
+        job_id=job_id,
+        owner=owner,
+        repo_name=repo_name,
+        ref=ref,
+        scratch=scratch,
+        batches=batches,
+        files_dir=files_dir,
+        log_fh=log_fh,
+        options=options,
+        token=token,
+    )
+    return walk_result, file_summaries
+
+
+def _planned_source_bytes(sizes: dict[str, int], options: dict[str, Any]) -> int:
+    """Sum of bytes the walker would *want* to analyze (size cap applied,
+    no other filter — directory and gitignore filters could reduce this
+    further, but planning a switch on a possibly-overestimated number
+    is fine; better to switch to streaming when in doubt).
+    """
+    cap = options["max_file_bytes"]
+    return sum(s for s in sizes.values() if 0 < s <= cap)
+
+
+def _bin_pack(entries: list[walker.TreeEntry], limit: int) -> list[list[walker.TreeEntry]]:
+    """Greedy first-fit-decreasing bin packing.
+
+    Each batch's total size is <= `limit` bytes, except for a single
+    file that itself exceeds `limit` (which gets its own batch — this
+    can't happen for the streaming path under normal options because
+    `max_file_bytes` is well below `max_partial_clone_bytes`, but we
+    handle it defensively).
+    """
+    if limit <= 0:
+        return [list(entries)]
+    sorted_entries = sorted(entries, key=lambda e: -e.size)
+    batches: list[list[walker.TreeEntry]] = []
+    batch_sizes: list[int] = []
+    for entry in sorted_entries:
+        placed = False
+        for i, current_size in enumerate(batch_sizes):
+            if current_size + entry.size <= limit:
+                batches[i].append(entry)
+                batch_sizes[i] = current_size + entry.size
+                placed = True
+                break
+        if not placed:
+            batches.append([entry])
+            batch_sizes.append(entry.size)
+    return batches
+
+
+def _process_streaming_batches(
+    *,
+    job_id: str,
+    owner: str,
+    repo_name: str,
+    ref: str,
+    scratch: Path,
+    batches: list[list[walker.TreeEntry]],
+    files_dir: Path,
+    log_fh: Any,
+    options: dict[str, Any],
+    token: str | None,
+) -> list[dict[str, Any]]:
+    """Sequential batches; within each batch fetch in parallel, analyze
+    in parallel, then delete the batch's files before the next."""
+    summaries: list[dict[str, Any]] = []
+    if not batches:
+        return summaries
+
+    # One executor for the whole job; per-batch lifecycle would re-pay
+    # the macOS spawn cost on every batch.
+    fetch_workers = 16
+    with ProcessPoolExecutor() as pool:
+        for batch_idx, batch in enumerate(batches):
+            if _is_cancelled(job_id):
+                break
+
+            batch_bytes = sum(e.size for e in batch)
+            _emit(
+                log_fh,
+                {
+                    "event": "batch_start",
+                    "index": batch_idx,
+                    "files": len(batch),
+                    "bytes": batch_bytes,
+                },
+            )
+
+            fetched = _fetch_batch(
+                owner=owner,
+                repo_name=repo_name,
+                ref=ref,
+                scratch=scratch,
+                batch=batch,
+                token=token,
+                workers=fetch_workers,
+            )
+
+            futures: dict[Any, str] = {}
+            for entry in batch:
+                if entry.path not in fetched:
+                    _emit(
+                        log_fh,
+                        {"event": "file_failed", "path": entry.path, "error": "raw fetch failed"},
+                    )
+                    with _lock:
+                        _jobs[job_id]["errors_count"] += 1
+                        _jobs[job_id]["files_done"] += 1
+                    continue
+                fut = pool.submit(
+                    _worker_disk,
+                    entry.path,
+                    str(scratch / entry.path),
+                    options["include_chunks"],
+                    options["chunk_max_tokens"],
+                )
+                futures[fut] = entry.path
+
+            for fut in as_completed(futures):
+                rel = futures[fut]
+                _drain_one(fut, rel, files_dir, log_fh, summaries, job_id)
+
+            for entry in batch:
+                with contextlib.suppress(OSError):
+                    (scratch / entry.path).unlink()
+            _emit(log_fh, {"event": "batch_done", "index": batch_idx})
+    return summaries
+
+
+def _fetch_batch(
+    *,
+    owner: str,
+    repo_name: str,
+    ref: str,
+    scratch: Path,
+    batch: list[walker.TreeEntry],
+    token: str | None,
+    workers: int,
+) -> set[str]:
+    """Fetch each file in `batch` to disk in parallel via raw URLs.
+
+    Returns the set of paths that landed on disk successfully. Failed
+    fetches are silently dropped from the set; the caller decides how
+    to log them.
+    """
+    fetched: set[str] = set()
+    fetch_lock = threading.Lock()
+
+    def _one(entry: walker.TreeEntry) -> None:
+        content = github.fetch_blob_via_raw(
+            owner,
+            repo_name,
+            ref,
+            entry.path,
+            token=token,
+        )
+        if content is None:
+            return
+        target = scratch / entry.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_bytes(content)
+        except OSError:
+            return
+        with fetch_lock:
+            fetched.add(entry.path)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_one, batch))
+    return fetched
+
+
 def _options_from_args(arguments: dict[str, Any]) -> dict[str, Any]:
     max_bytes = int(arguments.get("max_file_bytes", 2 * 1024 * 1024))
     return {
@@ -230,6 +575,9 @@ def _options_from_args(arguments: dict[str, Any]) -> dict[str, Any]:
         "chunk_max_tokens": int(arguments.get("chunk_max_tokens", 800)),
         "eager_clone": bool(arguments.get("eager_clone", False)),
         "github_api": bool(arguments.get("github_api", True)),
+        "max_partial_clone_bytes": int(
+            arguments.get("max_partial_clone_bytes", DEFAULT_MAX_PARTIAL_CLONE_BYTES)
+        ),
     }
 
 
@@ -306,56 +654,19 @@ def _run_job(job_id: str) -> None:
 
             # Optional pre-flight: ask GitHub's Trees API for path+size
             # of every blob in HEAD (one HTTP call, no blobs fetched).
-            # Used to fill in real sizes for unfetched files in tree.json.
-            # Silent fallback on rate-limit / network error / private
-            # repo without token / >100k entries.
+            # Used both as input to the streaming-vs-single decision and
+            # to fill in real sizes for unfetched files in tree.json.
             size_overrides = _maybe_fetch_github_sizes(src_arg, git_ref, options, log_fh)
 
-            resolved = source.resolve_source(
-                source=src_arg,
-                output_dir=output_dir,
-                git_ref=git_ref,
-                max_blob_bytes=options["max_file_bytes"],
-                eager_clone=options["eager_clone"],
-            )
-            _emit(log_fh, {"event": "source_resolved", "root": str(resolved.root)})
-
-            walk_result = walker.walk_full(
-                resolved.root,
-                respect_gitignore=options["respect_gitignore"],
-                extra_ignore_globs=options["extra_ignore_globs"],
-                max_file_bytes=options["max_file_bytes"],
-            )
-            # If this was a partial clone, blobs over `max_file_bytes`
-            # never made it to disk. Pull them out of HEAD via git
-            # ls-tree so they still appear in tree.json — cobgrind gets
-            # the full directory map even when we deliberately skipped
-            # the bytes. The Trees API pre-flight (above) gives us the
-            # real sizes for those unfetched entries.
-            walker.annotate_with_unfetched_blobs(
-                walk_result,
-                resolved.root,
-                size_overrides=size_overrides,
-            )
-
-            with _lock:
-                _jobs[job_id]["files_total"] = len(walk_result.included)
-            _emit(
-                log_fh,
-                {
-                    "event": "walk_done",
-                    "included": len(walk_result.included),
-                    "skipped": len(walk_result.skipped),
-                },
-            )
-
-            file_summaries = _process_files(
+            walk_result, file_summaries = _run_one_of(
                 job_id=job_id,
-                root=resolved.root,
-                entries=walk_result.included,
+                src_arg=src_arg,
+                git_ref=git_ref,
+                output_dir=output_dir,
                 files_dir=files_dir,
                 log_fh=log_fh,
                 options=options,
+                size_overrides=size_overrides,
             )
 
             elapsed = time.time() - _jobs[job_id]["started_at"]
