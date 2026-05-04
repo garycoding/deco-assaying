@@ -125,6 +125,31 @@ def cancel(job_id: str) -> bool:
         return True
 
 
+def is_active(job_id: str) -> bool:
+    """True while the job is in the table and hasn't reached a terminal state.
+
+    Used by the retention sweeper and the DELETE /outputs/{id} endpoint
+    to refuse to nuke a still-running job's output dir out from under
+    the worker thread.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+        return bool(job and job["status"] not in _TERMINAL_STATES)
+
+
+def drop(job_id: str) -> bool:
+    """Remove a job's table entry. Returns True if it was present.
+
+    The caller is responsible for removing the on-disk output dir; this
+    function only touches the in-memory table.
+    """
+    with _lock:
+        if job_id in _jobs:
+            del _jobs[job_id]
+            return True
+        return False
+
+
 def list_jobs(limit: int = JOB_HISTORY_MAX, status: str | None = None) -> list[dict[str, Any]]:
     limit = max(1, min(limit, JOB_HISTORY_MAX))
     with _lock:

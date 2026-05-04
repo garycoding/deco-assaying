@@ -11,13 +11,14 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse, StreamingResponse
 from mcp import types
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import BaseModel
 
-from deco_assaying import analyze, jobs, languages
+from deco_assaying import analyze, jobs, languages, outputs
 from deco_assaying.config import JOB_HISTORY_MAX, VERSION
 
 
@@ -393,6 +394,195 @@ async def admin_job_log(job_id: str, from_offset: int = 0, limit: int = 1000) ->
 @router.get("/admin/stats", response_model=Stats, tags=["admin"])
 async def admin_stats() -> Stats:
     return Stats(version=VERSION, **jobs.stats())
+
+
+# ---------------------------------------------------------------------------
+# /outputs/{job_id}/... — read-only download API for finished jobs.
+#
+# Lets a remote consumer (no shared volume) pull artifacts without ever
+# touching disk, and lets a local consumer (shared volume) skip the API
+# entirely and read off disk. Either way, the on-disk layout under
+# OUTPUT_ROOT/{job_id}/ is the source of truth.
+
+
+class LsRow(BaseModel):
+    path: str
+    size: int
+    mtime: float
+    is_dir: bool
+
+
+class LsResponse(BaseModel):
+    entries: list[LsRow]
+
+
+class OutputSummary(BaseModel):
+    job_id: str
+    size: int
+    mtime: float
+
+
+def _job_dir_or_404(job_id: str):
+    job_dir = outputs.resolve_job_dir(job_id)
+    if job_dir is None:
+        raise HTTPException(status_code=404, detail="unknown_job_id")
+    return job_dir
+
+
+def _serve_named_json(job_id: str, name: str) -> FileResponse:
+    job_dir = _job_dir_or_404(job_id)
+    target = job_dir / name
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"{name} not present")
+    return FileResponse(target, media_type="application/json")
+
+
+@router.get("/outputs/{job_id}", tags=["outputs"])
+async def outputs_root(job_id: str) -> FileResponse:
+    """Convenience: same as `manifest.json`. One GET tells the consumer
+    the job's shape (file count, languages, status) without any further
+    chatter."""
+    return _serve_named_json(job_id, "manifest.json")
+
+
+@router.get("/outputs/{job_id}/manifest.json", tags=["outputs"])
+async def outputs_manifest(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "manifest.json")
+
+
+@router.get("/outputs/{job_id}/tree.json", tags=["outputs"])
+async def outputs_tree(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "tree.json")
+
+
+@router.get("/outputs/{job_id}/symbols.json", tags=["outputs"])
+async def outputs_symbols(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "symbols.json")
+
+
+@router.get("/outputs/{job_id}/languages.json", tags=["outputs"])
+async def outputs_languages(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "languages.json")
+
+
+@router.get("/outputs/{job_id}/errors.json", tags=["outputs"])
+async def outputs_errors(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "errors.json")
+
+
+@router.get("/outputs/{job_id}/log.jsonl", response_model=LogEvents, tags=["outputs"])
+async def outputs_log(job_id: str, from_offset: int = 0, limit: int = 1000) -> LogEvents:
+    """Same shape as `/admin/jobs/{id}/log` — re-exposed under /outputs
+    so a consumer treating the artifact dir as the source of truth doesn't
+    need to know about /admin."""
+    limit = max(1, min(limit, 100_000))
+    from_offset = max(0, from_offset)
+    result = jobs.read_log(job_id, from_offset=from_offset, limit=limit)
+    if result is None:
+        raise HTTPException(status_code=404, detail="unknown_job_id")
+    return LogEvents(**result)
+
+
+@router.get("/outputs/{job_id}/ls", response_model=LsResponse, tags=["outputs"])
+async def outputs_ls(job_id: str, path: str = "", recursive: bool = False) -> LsResponse:
+    """Directory listing rooted at `path` (relative to the job dir).
+
+    With `recursive=true`, walks the whole subtree. Each row reports
+    relative path, byte size (0 for dirs), mtime, and is_dir.
+    """
+    job_dir = _job_dir_or_404(job_id)
+    try:
+        sub = outputs.safe_subpath(job_dir, path)
+    except outputs.OutputError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not sub.exists():
+        raise HTTPException(status_code=404, detail="path not found")
+    try:
+        rows = outputs.list_dir(job_dir, sub, recursive=recursive)
+    except outputs.OutputError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return LsResponse(entries=[LsRow(**r) for r in rows])
+
+
+@router.get("/outputs/{job_id}/file/{path:path}", tags=["outputs"])
+async def outputs_file(job_id: str, path: str):
+    """Content-aware download. If the last segment is a glob (`*?[`),
+    expands it under the parent dir and streams a ZIP of the matches.
+    Otherwise serves the single file."""
+    job_dir = _job_dir_or_404(job_id)
+    last = path.rsplit("/", 1)[-1]
+    if any(outputs.is_glob(seg) for seg in path.split("/")):
+        # A glob anywhere in the path → ZIP of matches. We don't try to
+        # validate "the parent dir exists" because patterns like
+        # `files/**/*.py.json` deliberately have `**` in the parent.
+        # expand_glob() rooted at job_dir provides the safety boundary.
+        files = outputs.expand_glob(job_dir, path)
+        return StreamingResponse(
+            outputs.stream_zip(job_dir, files),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{job_id}-{last}.zip"',
+            },
+        )
+    try:
+        target = outputs.safe_subpath(job_dir, path)
+    except outputs.OutputError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    return FileResponse(target)
+
+
+@router.get("/outputs/{job_id}/zip", tags=["outputs"])
+async def outputs_zip(job_id: str, path: str = "", match: str = "**/*"):
+    """Explicit-bulk-zip alias. Defaults to the whole job dir.
+
+    `path` selects a subdirectory; `match` is a glob applied beneath
+    it (default `**/*`). Streams `application/zip`.
+    """
+    job_dir = _job_dir_or_404(job_id)
+    try:
+        sub = outputs.safe_subpath(job_dir, path)
+    except outputs.OutputError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not sub.is_dir():
+        raise HTTPException(status_code=404, detail="path not found")
+    # Build the pattern relative to job_dir (Path.glob is rooted there).
+    sub_rel = "" if sub == job_dir else str(sub.relative_to(job_dir))
+    pattern = f"{sub_rel}/{match}" if sub_rel else match
+    files = outputs.expand_glob(job_dir, pattern)
+    return StreamingResponse(
+        outputs.stream_zip(job_dir, files),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}.zip"'},
+    )
+
+
+@router.delete("/outputs/{job_id}", status_code=204, tags=["outputs"])
+async def outputs_delete(job_id: str) -> Response:
+    """Remove the job's output dir and drop its row from the in-memory
+    table. Refuses to delete an active (non-terminal) job."""
+    if jobs.is_active(job_id):
+        raise HTTPException(status_code=409, detail="job is still running; cancel first")
+    job_dir = outputs.resolve_job_dir(job_id)
+    dropped = jobs.drop(job_id)
+    if job_dir is None and not dropped:
+        raise HTTPException(status_code=404, detail="unknown_job_id")
+    if job_dir is not None:
+        try:
+            outputs.remove_job_dir(job_dir)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"removal failed: {e}") from e
+    return Response(status_code=204)
+
+
+@router.get("/admin/outputs", response_model=list[OutputSummary], tags=["admin"])
+async def admin_outputs() -> list[OutputSummary]:
+    """List every job_id present on disk under OUTPUT_ROOT, with size +
+    mtime. Includes jobs that have aged out of the in-memory table."""
+    return [OutputSummary(**row) for row in outputs.list_outputs_root()]
 
 
 # ---------------------------------------------------------------------------
