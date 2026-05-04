@@ -20,16 +20,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from deco_assaying.app import app
-
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
 
 
-@pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:
-        yield c
+@pytest.fixture
+def client(mcp_client: TestClient) -> TestClient:
+    """Alias to the session-scoped mcp_client from conftest.py — keeps
+    this module's existing test signatures working."""
+    return mcp_client
 
 
 @pytest.fixture
@@ -244,6 +243,14 @@ def test_mcp_tools_list(client: TestClient):
         "index_repo",
         "get_job_status",
         "cancel_job",
+        "get_manifest",
+        "get_tree",
+        "get_symbols",
+        "get_languages",
+        "get_errors",
+        "get_file_analysis",
+        "list_job_files",
+        "get_log_events",
         "list_supported_languages",
         "detect_language",
     }
@@ -320,12 +327,13 @@ def test_mcp_index_repo_end_to_end(client: TestClient, tmp_path: Path, output_ro
         {"source": str(src)},
         req_id=300,
     )
-    assert "job_id" in started
-    assert "output_path" in started
+    # The MCP-facing index_repo response is intentionally minimal — just
+    # job_id. Host-side paths (output_path, manifest_path, log_path) are
+    # noise to a remote LLM and stripped on this surface.
+    assert started.keys() == {"job_id"}
     job_id = started["job_id"]
-    out = Path(started["output_path"])
-    assert out.parent == output_root
-    assert out.name == job_id
+    # We can still cross-check the on-disk dir via the admin API.
+    out = output_root / job_id
 
     # Poll get_job_status until done.
     deadline = time.time() + 20
@@ -344,11 +352,17 @@ def test_mcp_index_repo_end_to_end(client: TestClient, tmp_path: Path, output_ro
         pytest.fail("index_repo job did not finish in time")
 
     assert snap["state"] == "done", f"job snap: {snap}"
-    assert snap["output_path"] == str(out)
+    # No output_path / manifest_path / log_path on the LLM-facing snapshot.
+    assert "output_path" not in snap
+    assert "manifest_path" not in snap
+    assert "log_path" not in snap
     assert snap["progress"]["files_done"] >= 2
     assert snap["progress"]["files_total"] >= 2
 
-    manifest_path = Path(snap["manifest_path"])
+    # The artifacts still exist on disk; verify via the admin API which
+    # is allowed to expose host paths.
+    admin = client.get(f"/admin/jobs/{job_id}").json()
+    manifest_path = Path(admin["manifest_path"])
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text())
     assert "python" in manifest["languages"]
@@ -401,7 +415,7 @@ def test_mcp_index_repo_clones_public_github(client: TestClient, output_root: Pa
         req_id=600,
     )
     job_id = started["job_id"]
-    out = Path(started["output_path"])
+    out = output_root / job_id
 
     # Clone + analyze every file: generous timeout for slow networks.
     deadline = time.time() + 120

@@ -1,6 +1,7 @@
-"""Helpers for the `/outputs/{job_id}/...` download API.
+"""Helpers for the `/outputs/{job_id}/...` download API and the
+`get_*` artifact-fetch MCP tools.
 
-Three concerns live here:
+Concerns:
 
 1. **Path safety.** Every consumer-supplied path is resolved against
    the job's output root and rejected if it escapes (symlink trickery,
@@ -12,22 +13,33 @@ Three concerns live here:
    an unseekable buffer, yielding bytes as they accumulate. Lets a
    FastAPI `StreamingResponse` send a multi-GB archive without buffering
    the whole thing in memory.
+4. **Artifact reads with optional filtering.** `read_*` helpers parse
+   each rollup file and apply LLM-friendly narrowing args (`prefix`,
+   `path_prefix`, `kind`) so the model can ask for slices of large
+   payloads instead of the whole thing.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import io
+import json
 import shutil
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from deco_assaying import config, jobs
 
 
 class OutputError(Exception):
     """Raised when a /outputs/{id}/... request can't be served safely."""
+
+
+class ArtifactMissing(OutputError):
+    """A specific artifact (e.g. manifest.json) hasn't been written yet —
+    typically because the job is still running or never finished cleanly."""
 
 
 class LsRow(TypedDict):
@@ -223,3 +235,150 @@ def _dir_size(path: Path) -> int:
         except OSError:
             continue
     return total
+
+
+# ---------------------------------------------------------------------------
+# Artifact reads — parsed JSON, with narrowing args for the bigger rollups.
+#
+# Each helper raises ArtifactMissing if the on-disk file isn't there yet
+# (e.g. the job is still running). The MCP tool layer turns that into a
+# structured error result for the LLM.
+
+
+def _load_json(job_dir: Path, name: str) -> Any:
+    path = job_dir / name
+    if not path.is_file():
+        raise ArtifactMissing(f"{name} not present (job not done yet?)")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def read_manifest(job_dir: Path) -> dict[str, Any]:
+    return _load_json(job_dir, "manifest.json")
+
+
+def read_languages(job_dir: Path) -> dict[str, Any]:
+    return _load_json(job_dir, "languages.json")
+
+
+def read_errors(job_dir: Path) -> dict[str, Any]:
+    return _load_json(job_dir, "errors.json")
+
+
+def read_tree(
+    job_dir: Path,
+    *,
+    path_prefix: str = "",
+    analyzed_only: bool = False,
+) -> dict[str, Any]:
+    """`tree.json` with optional path-prefix and analyzed-only filters.
+
+    Comparison is case-sensitive forward-slash prefix match.
+    """
+    raw = _load_json(job_dir, "tree.json")
+    entries = raw.get("entries", [])
+    if path_prefix:
+        normalized = path_prefix.lstrip("/")
+        entries = [e for e in entries if e["path"].startswith(normalized)]
+    if analyzed_only:
+        entries = [e for e in entries if e.get("analyzed")]
+    return {
+        "entries": entries,
+        "filters": {"path_prefix": path_prefix, "analyzed_only": analyzed_only},
+        "total_in_repo": len(raw.get("entries", [])),
+        "total_returned": len(entries),
+    }
+
+
+def read_symbols(
+    job_dir: Path,
+    *,
+    prefix: str = "",
+    kind: str = "",
+    file_prefix: str = "",
+) -> dict[str, Any]:
+    """`symbols.json` with optional qualified-name-prefix, kind, and
+    file-prefix filters. All three combine (AND)."""
+    raw = _load_json(job_dir, "symbols.json")
+    entries = raw.get("entries", [])
+    if prefix:
+        entries = [e for e in entries if e["qualified_name"].startswith(prefix)]
+    if kind:
+        entries = [e for e in entries if e.get("kind") == kind]
+    if file_prefix:
+        normalized = file_prefix.lstrip("/")
+        entries = [e for e in entries if e["file"].startswith(normalized)]
+    return {
+        "entries": entries,
+        "filters": {"prefix": prefix, "kind": kind, "file_prefix": file_prefix},
+        "total_in_repo": len(raw.get("entries", [])),
+        "total_returned": len(entries),
+    }
+
+
+_FILE_ANALYSIS_SECTIONS = (
+    "file",
+    "module_doc",
+    "symbols",
+    "imports",
+    "exports",
+    "references",
+    "literals_of_interest",
+    "chunks",
+    "metrics",
+    "parse",
+)
+
+
+def read_file_analysis(
+    job_dir: Path,
+    rel_path: str,
+    *,
+    sections: list[str] | None = None,
+) -> dict[str, Any]:
+    """One per-file artifact under `files/`, optionally trimmed to a
+    subset of top-level sections.
+
+    `rel_path` is the source path (e.g. `src/foo.py`); we append `.json`
+    and resolve under `files/`. Path-traversal-safe.
+    """
+    files_dir = safe_subpath(job_dir, "files")
+    artifact = safe_subpath(job_dir, f"files/{rel_path.lstrip('/')}.json")
+    if not _is_under(artifact.resolve(), files_dir.resolve()):
+        raise OutputError(f"path escapes files/: {rel_path!r}")
+    if not artifact.is_file():
+        raise ArtifactMissing(f"no analysis for {rel_path!r}")
+    with open(artifact, encoding="utf-8") as f:
+        data = json.load(f)
+    if sections is None:
+        return data
+    invalid = set(sections) - set(_FILE_ANALYSIS_SECTIONS)
+    if invalid:
+        raise OutputError(f"unknown sections: {sorted(invalid)}; valid: {list(_FILE_ANALYSIS_SECTIONS)}")
+    return {k: data.get(k) for k in sections if k in data}
+
+
+def list_file_artifacts(job_dir: Path, *, glob: str = "") -> dict[str, Any]:
+    """List every per-file artifact path under `files/` (without the
+    `.json` suffix, so the caller sees source-relative paths).
+
+    Optional `glob` is fnmatch-style and matches against the source
+    path (e.g. `src/**/*.py` — but recursion `**` works only via
+    Path.glob, so we use that). Empty glob → list everything.
+    """
+    files_dir = job_dir / "files"
+    if not files_dir.is_dir():
+        raise ArtifactMissing("files/ not present (job not done yet?)")
+    paths: list[str] = []
+    for artifact in files_dir.rglob("*.json"):
+        if not artifact.is_file():
+            continue
+        rel = artifact.relative_to(files_dir).as_posix()
+        # Strip the `.json` extension so the caller sees the original source path.
+        if rel.endswith(".json"):
+            rel = rel[: -len(".json")]
+        paths.append(rel)
+    paths.sort()
+    if glob:
+        paths = [p for p in paths if fnmatch.fnmatch(p, glob)]
+    return {"paths": paths, "count": len(paths), "glob": glob}

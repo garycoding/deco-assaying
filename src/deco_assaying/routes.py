@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncIterator
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Response
@@ -48,17 +49,29 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="analyze_file",
             description=(
-                "Analyze a single source file passed inline as text. Returns "
-                "structured JSON: file metadata, symbols, imports, exports, "
-                "outgoing references, literals of interest, AST-aware chunks, "
-                "metrics, and parse status. The server does not read from disk."
+                "Analyze ONE source file whose raw bytes you already "
+                "have (e.g. the user pasted them, or you read them from "
+                "a known path). Returns structured JSON: file metadata, "
+                "symbols, imports, exports, outgoing references, "
+                "literals of interest, AST-aware chunks, metrics, and "
+                "parse status. The server does not read from disk. "
+                "DO NOT use this to analyze a whole repository — call "
+                "index_repo instead, then read the rollups with "
+                "get_manifest, get_tree, get_symbols, etc. Never invent "
+                "file contents to pass here; if you don't have actual "
+                "source code in hand, don't call this tool."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "Source code as a UTF-8 string.",
+                        "description": (
+                            "The raw source code, exactly as it appears "
+                            "in the file. Plain text, UTF-8. NOT prose, "
+                            "NOT a summary, NOT markdown describing the "
+                            "code — the actual code."
+                        ),
                     },
                     "filename": {
                         "type": "string",
@@ -93,13 +106,18 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="index_repo",
             description=(
-                "Start an asynchronous job that indexes a repository (local "
-                "path, GitHub URL, or GitLab URL) and writes per-file JSON "
-                "artifacts plus a manifest.json. The server allocates a "
-                "fresh output directory under OUTPUT_ROOT (default ./output "
-                "for the daemon, /data in the docker image) and returns "
-                "the absolute path in `output_path`. Poll get_job_status "
-                "or watch output_path/log.jsonl."
+                "Analyze a code repository on GitHub, GitLab, or a local "
+                "filesystem path. Starts an asynchronous indexing job that "
+                "produces per-file JSON artifacts plus repo-level rollups "
+                "(manifest, tree, symbols, languages, errors). Returns "
+                "{job_id} immediately — do not wait inline. Poll "
+                'get_job_status until state == "done", then read the '
+                "results via the artifact-fetch tools: get_manifest, "
+                "get_tree, get_symbols, get_languages, get_errors, "
+                "list_job_files, and get_file_analysis. "
+                "Use this — not analyze_file — for any whole-repo "
+                "question. See this tool's input schema for tunable "
+                "parameters."
             ),
             inputSchema={
                 "type": "object",
@@ -188,7 +206,11 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_job_status",
-            description="Return status, progress, and artifact paths for a job.",
+            description=(
+                "Return state, progress, and error info for an indexing "
+                'job. Poll this after index_repo until state == "done". '
+                "States: pending, running, done, failed, cancelled."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
@@ -197,10 +219,192 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="cancel_job",
-            description="Cooperatively cancel a running job.",
+            description="Cooperatively cancel a running indexing job.",
             inputSchema={
                 "type": "object",
                 "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_manifest",
+            description=(
+                "Return the repo-level rollup for a finished indexing "
+                "job. Always read this FIRST after a job completes — it "
+                "summarizes file count, languages, test/config/generated "
+                "buckets, parse-error count, and entry points. Small "
+                "payload."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_tree",
+            description=(
+                "Return the repo's full path inventory (analyzed + "
+                "skipped). Filter to a subdirectory with path_prefix to "
+                "avoid pulling the whole tree on a large repo."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "path_prefix": {
+                        "type": "string",
+                        "description": (
+                            "Forward-slash prefix to scope the listing "
+                            '(e.g. "src/auth/"). Empty = whole tree.'
+                        ),
+                        "default": "",
+                    },
+                    "analyzed_only": {
+                        "type": "boolean",
+                        "description": "Drop entries that were skipped (binary/oversize/gitignore).",
+                        "default": False,
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_symbols",
+            description=(
+                "Return the global symbol index — qualified-name → "
+                "(file, span, kind). Filter by qualified-name prefix, "
+                "symbol kind, and/or file-path prefix to keep responses "
+                "small. Filters combine with AND."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "prefix": {
+                        "type": "string",
+                        "description": 'Qualified-name prefix (e.g. "src.auth."). Empty = no filter.',
+                        "default": "",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": (
+                            "Symbol kind — one of module, class, interface, "
+                            "struct, enum, function, method, constructor, "
+                            "property, field, constant, type_alias, "
+                            "decorator, macro. Empty = no filter."
+                        ),
+                        "default": "",
+                    },
+                    "file_prefix": {
+                        "type": "string",
+                        "description": 'Source-path prefix (e.g. "src/auth/"). Empty = no filter.',
+                        "default": "",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_languages",
+            description="Return per-language file counts, byte sums, and lines of code. Small payload.",
+            inputSchema={
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_errors",
+            description="Return parse errors and skipped files for a job. Small payload.",
+            inputSchema={
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="list_job_files",
+            description=(
+                "Return the source-relative paths of every per-file "
+                "analysis artifact under files/. Use this to discover "
+                "what's available before fetching specific files with "
+                "get_file_analysis. Optional fnmatch glob filters the "
+                'list (e.g. "src/**/*.py").'
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "glob": {
+                        "type": "string",
+                        "description": "fnmatch-style glob over source paths. Empty = list all.",
+                        "default": "",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_file_analysis",
+            description=(
+                "Return the full per-file analysis for one source file "
+                "in a finished job: file metadata, symbols, imports, "
+                "exports, references, literals_of_interest, AST-aware "
+                "chunks, metrics, and parse status. Pass `sections` to "
+                'fetch only a subset (e.g. ["symbols","imports"]) to '
+                "skip the chunks payload, which is the largest part."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            'Source-relative path (e.g. "src/foo.py"). '
+                            "Use list_job_files to discover valid paths."
+                        ),
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional subset of top-level sections to "
+                            "return. Valid: file, module_doc, symbols, "
+                            "imports, exports, references, "
+                            "literals_of_interest, chunks, metrics, "
+                            "parse. Empty / omitted = all sections."
+                        ),
+                        "default": [],
+                    },
+                },
+                "required": ["job_id", "path"],
+            },
+        ),
+        types.Tool(
+            name="get_log_events",
+            description=(
+                "Tail the job's append-only event log. Useful for "
+                "monitoring progress while a job is still running, or "
+                "debugging a failed run. Returns parsed events plus a "
+                "next_offset cursor for incremental polling."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "from_offset": {
+                        "type": "integer",
+                        "description": "Byte offset into log.jsonl to resume from.",
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max events to return (1..100000).",
+                        "default": 1000,
+                    },
+                },
                 "required": ["job_id"],
             },
         ),
@@ -232,6 +436,32 @@ def _ok(payload: Any) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(payload))]
 
 
+def _llm_view(snap: dict[str, Any]) -> dict[str, Any]:
+    """Strip host-side paths from a job snapshot for the LLM-facing
+    surface. The HTTP /admin/* endpoints still expose the full snapshot
+    for ops; the MCP transport doesn't, because those paths aren't
+    reachable from the model anyway and just take up tokens."""
+    return {
+        "job_id": snap["job_id"],
+        "source": snap["source"],
+        "state": snap["state"],
+        "progress": snap["progress"],
+        "errors_count": snap["errors_count"],
+        "started_at": snap["started_at"],
+        "finished_at": snap["finished_at"],
+        "error": snap["error"],
+    }
+
+
+def _job_dir_for_mcp(job_id: str) -> Path | str:
+    """Resolve the on-disk job dir for an artifact-fetch tool. Returns
+    a Path on success, or a string error code suitable for `_ok`."""
+    job_dir = outputs.resolve_job_dir(job_id)
+    if job_dir is None:
+        return "unknown_job_id"
+    return job_dir
+
+
 @mcp.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
@@ -247,17 +477,86 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
 
         if name == "index_repo":
-            job_id, output_path = jobs.start_index_repo(arguments)
-            return _ok({"job_id": job_id, "output_path": str(output_path)})
+            job_id, _ = jobs.start_index_repo(arguments)
+            return _ok({"job_id": job_id})
 
         if name == "get_job_status":
             snap = jobs.get_status(arguments["job_id"])
             if snap is None:
                 return _ok({"error": "unknown_job_id"})
-            return _ok(snap)
+            return _ok(_llm_view(snap))
 
         if name == "cancel_job":
             return _ok({"ok": jobs.cancel(arguments["job_id"])})
+
+        if name in {
+            "get_manifest",
+            "get_tree",
+            "get_symbols",
+            "get_languages",
+            "get_errors",
+            "get_file_analysis",
+            "list_job_files",
+            "get_log_events",
+        }:
+            jd = _job_dir_for_mcp(arguments["job_id"])
+            if isinstance(jd, str):
+                return _ok({"error": jd})
+            try:
+                if name == "get_manifest":
+                    return _ok(outputs.read_manifest(jd))
+                if name == "get_languages":
+                    return _ok(outputs.read_languages(jd))
+                if name == "get_errors":
+                    return _ok(outputs.read_errors(jd))
+                if name == "get_tree":
+                    return _ok(
+                        outputs.read_tree(
+                            jd,
+                            path_prefix=arguments.get("path_prefix") or "",
+                            analyzed_only=bool(arguments.get("analyzed_only", False)),
+                        )
+                    )
+                if name == "get_symbols":
+                    return _ok(
+                        outputs.read_symbols(
+                            jd,
+                            prefix=arguments.get("prefix") or "",
+                            kind=arguments.get("kind") or "",
+                            file_prefix=arguments.get("file_prefix") or "",
+                        )
+                    )
+                if name == "get_file_analysis":
+                    sections = arguments.get("sections") or None
+                    if sections == []:
+                        sections = None
+                    return _ok(
+                        outputs.read_file_analysis(
+                            jd,
+                            arguments["path"],
+                            sections=sections,
+                        )
+                    )
+                if name == "list_job_files":
+                    return _ok(
+                        outputs.list_file_artifacts(
+                            jd,
+                            glob=arguments.get("glob") or "",
+                        )
+                    )
+                if name == "get_log_events":
+                    result = jobs.read_log(
+                        arguments["job_id"],
+                        from_offset=max(0, int(arguments.get("from_offset", 0))),
+                        limit=max(1, min(int(arguments.get("limit", 1000)), 100_000)),
+                    )
+                    if result is None:
+                        return _ok({"error": "unknown_job_id"})
+                    return _ok(result)
+            except outputs.ArtifactMissing as e:
+                return _ok({"error": "artifact_missing", "detail": str(e)})
+            except outputs.OutputError as e:
+                return _ok({"error": "bad_request", "detail": str(e)})
 
         if name == "list_supported_languages":
             return _ok(languages.list_supported())
