@@ -7,48 +7,113 @@ base over many codebases.
 
 ## Run
 
-Three options, ordered by ease-of-install for the consumer.
+Pick the deployment that matches your situation:
 
-### 1. `uv tool install` (PyPI)
+| Mode | Command | When to use |
+|---|---|---|
+| Daemon — pinned install | [`uv tool install`](#1-daemon--uv-tool-install-pypi) | You'll run it across many sessions; want it on `$PATH`. |
+| Daemon — ephemeral | [`uvx`](#2-daemon--uvx-no-install) | One-off run; don't want anything left on disk. |
+| Container | [`docker run` from GHCR](#3-docker--ghcr) | Ops deployment, compose stack, or want filesystem isolation. |
+| From source | [`uv run`](#4-from-source) | Hacking on the server itself. |
+
+### Prereqs
+
+- **uv-based modes** need [`uv`](https://docs.astral.sh/uv/) and `git`.
+  uv ships a portable Python 3.13, so no system Python install required.
+
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+- **Docker mode** needs `docker` (or compatible). The image bundles
+  Python 3.13 and git; nothing else on the host.
+
+### 1. Daemon — `uv tool install` (PyPI)
+
+Installs the `deco-assaying` command on your `$PATH`, isolated in its
+own venv that uv manages.
 
 ```bash
 uv tool install deco-assaying
-deco-assaying
+deco-assaying                     # starts the server
 ```
 
-You need [`uv`](https://docs.astral.sh/uv/) and `git`. uv ships its own
-portable Python 3.13, so no system Python install required.
+Update later with `uv tool upgrade deco-assaying`; remove with
+`uv tool uninstall deco-assaying`.
 
-### 2. Docker / GHCR
+### 2. Daemon — `uvx` (no install)
+
+`uvx` resolves the package into a temporary venv and runs the entry
+point in one shot. Nothing persists between runs.
 
 ```bash
-docker run --rm -p 35832:35832 -v deco-assaying-data:/data \
+uvx deco-assaying                       # latest release
+uvx deco-assaying@0.1.0                 # pin a specific version
+```
+
+Good for kicking the tires or running on a CI box where you don't
+want to touch `~/.local/share/uv`.
+
+### 3. Docker / GHCR
+
+Pull and run the published multi-arch image (linux/amd64 +
+linux/arm64):
+
+```bash
+docker pull ghcr.io/garycoding/deco-assaying:latest
+docker run --rm \
+  -p 35832:35832 \
+  -v deco-assaying-data:/data \
   ghcr.io/garycoding/deco-assaying:latest
 ```
 
-Or with compose (see [docker-compose.yml](docker-compose.yml)):
+Pin a specific version with a tag — `:0.1.0`, `:0.1`, or `:latest`
+(see the [Releases](https://github.com/garycoding/deco-assaying/pkgs/container/deco-assaying)
+page on GHCR for the available tags).
+
+Or with compose (see [docker-compose.yml](docker-compose.yml) — pulls
+the image, mounts a named volume at `/data`, restarts on failure):
 
 ```bash
-docker compose up
+docker compose up -d
 ```
 
-The image bundles git + Python; the named volume persists job
-outputs across restarts.
-
-### 3. From source
+The named volume `deco-assaying-data` persists job outputs across
+container restarts. To pass auth tokens for private repos:
 
 ```bash
+docker run --rm \
+  -e GITHUB_TOKEN=ghp_... \
+  -e GITLAB_TOKEN=glpat-... \
+  -p 35832:35832 \
+  -v deco-assaying-data:/data \
+  ghcr.io/garycoding/deco-assaying:latest
+```
+
+### 4. From source
+
+```bash
+git clone https://github.com/garycoding/deco-assaying.git
+cd deco-assaying
 uv sync
 uv run python -m deco_assaying
 ```
 
-The server listens on `PORT` (default `35832`) with:
+### Endpoints
+
+In every mode the server listens on `PORT` (default `35832`) with:
 
 - `POST /sse` — MCP Streamable HTTP transport.
 - `GET /health` — liveness probe.
 - `GET /admin/*` — read-only JSON ops endpoints.
 - `GET /outputs/{job_id}/...` — read-only download API for job artifacts.
 - `GET /docs` — OpenAPI / Swagger UI for the HTTP API.
+
+Sanity-check it's up:
+
+```bash
+curl http://127.0.0.1:35832/health
+```
 
 ## MCP tools
 
