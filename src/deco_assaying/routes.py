@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -18,7 +19,7 @@ from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import BaseModel
 
-from deco_assaying import analyze, jobs, languages, outputs
+from deco_assaying import analyze, jobs, languages, outputs, retention
 from deco_assaying.config import JOB_HISTORY_MAX, VERSION
 
 
@@ -593,5 +594,11 @@ async def admin_outputs() -> list[OutputSummary]:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     uvlog = logging.getLogger("uvicorn.error")
     async with session_manager.run():
+        sweeper = asyncio.create_task(retention.run_forever(), name="retention-sweeper")
         uvlog.info("deco-assaying v%s ready", VERSION)
-        yield
+        try:
+            yield
+        finally:
+            sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper
