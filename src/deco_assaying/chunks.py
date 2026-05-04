@@ -11,7 +11,7 @@ the next sibling would exceed `max_tokens`, flush the buffer as one chunk;
 if a single child is itself larger than `max_tokens`, recurse into it.
 
 Token estimation is intentionally cheap and approximate (ceil(bytes / 4)) —
-the consumer (Cobgrind) re-tokenizes anyway when it embeds.
+the consumer re-tokenizes anyway when it embeds.
 
 Each emitted chunk is annotated with the qualified_name and node-kind of
 the closest enclosing symbol, so a downstream embedding pipeline can store

@@ -18,7 +18,8 @@ Notes for the next reader:
 - `qualified_name` is dotted from the module root: a method `m` on class
   `Foo` is `Foo.m`; a method on a nested class `Foo.Bar.m` is `Foo.Bar.m`.
 - We don't follow imports; references contain the literal qualifier strings
-  the source uses. Cobgrind resolves cross-file once it has every file.
+  the source uses. Cross-file resolution is the consumer's job once it has
+  every file.
 """
 
 from __future__ import annotations

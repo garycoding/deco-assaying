@@ -19,9 +19,9 @@ app = FastAPI(
     title="deco-assaying",
     version=VERSION,
     description=(
-        "Tree-sitter-based source code analysis MCP server for the Cobgrind "
-        "LLM-Wiki daemon. The /admin/* endpoints expose read-only ops "
-        "information; job control is on the MCP /sse surface."
+        "Tree-sitter-based source code analysis MCP server. The /admin/* "
+        "endpoints expose read-only ops information; job control is on "
+        "the MCP /sse surface."
     ),
     lifespan=lifespan,
     docs_url="/docs",

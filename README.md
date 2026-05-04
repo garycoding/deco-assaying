@@ -1,7 +1,9 @@
 # deco-assaying
 
-MCP server that performs tree-sitter-based source code analysis for the
-Cobgrind LLM-Wiki daemon.
+MCP server that performs tree-sitter-based source code analysis. Designed
+to feed structural information about a repo (symbols, imports, references,
+chunks, metrics) into a downstream consumer that maintains a knowledge
+base over many codebases.
 
 ## Run
 
@@ -50,7 +52,7 @@ disk footprint regardless of how large the source repo is:
 - **Output artifacts: roughly 1-2× the analyzed-source size.** Each
   analyzed file produces a JSON artifact under `output_dir/files/`
   containing symbols, imports, references, chunks, etc. These persist
-  past the job — cobgrind reads them as it ingests the wiki — and are
+  past the job — the consumer reads them incrementally — and are
   the largest *durable* footprint.
 
 - **Memory: modest.** A `ProcessPoolExecutor` runs roughly
@@ -80,5 +82,4 @@ the only on-disk cost is the output artifacts.
 | `GITHUB_TOKEN` | unset | Optional, raises GitHub Trees API quota from 60 to 5000 req/hr and unlocks private repos. |
 | `GITLAB_TOKEN` | unset | Optional, used for GitLab API auth and private-repo access. |
 
-See `/Users/gary/.claude/plans/cobgrind-is-a-daemon-fluttering-sutton.md` for
-the full design.
+See the design plan in `/Users/gary/.claude/plans/` for the full architecture.

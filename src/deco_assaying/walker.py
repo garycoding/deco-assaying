@@ -132,8 +132,8 @@ class TreeEntry:
 
     `analyzed=False` means the file passed the directory pruning step but
     a per-file filter rejected it; `skip_reason` records which one. We
-    record these so cobgrind has a complete picture of the repo (every
-    path the walker saw, what we did with each).
+    record these so the consumer has a complete picture of the repo
+    (every path the walker saw, what we did with each).
     """
 
     path: str  # forward-slash relative path
@@ -274,8 +274,8 @@ def annotate_with_unfetched_blobs(
     entry to `result.skipped` for every path in HEAD that didn't make it
     onto disk. In a `--filter=blob:limit=N` clone these are the blobs
     that exceeded N bytes — they're real files in the repo we just
-    didn't fetch, and cobgrind wants them in tree.json so the directory
-    map is complete.
+    didn't fetch, and the consumer wants them in tree.json so the
+    directory map is complete.
 
     Cheap: `git ls-tree -r HEAD` (without `--long`) doesn't read blob
     contents, so the partial-clone protocol isn't triggered. ~10ms for

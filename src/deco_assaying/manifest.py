@@ -1,7 +1,7 @@
 """Repo-level rollups: manifest.json, symbols.json, languages.json,
 errors.json, tree.json.
 
-These are written when an indexing job finishes. Cobgrind plans its
+These are written when an indexing job finishes. A consumer plans its
 ingestion order from the manifest without reading every per-file artifact;
 the separate `tree.json` gives it the full repo organization (including
 files we deliberately skipped) so it can build a faithful directory map
@@ -116,8 +116,8 @@ def _build_symbols_index(
 
     The index is structured as a list rather than a map because qualified
     names *can* collide across languages within a polyglot repo (think
-    `main.foo` in two unrelated Go packages). Cobgrind disambiguates using
-    the (file, span) tuple.
+    `main.foo` in two unrelated Go packages). The consumer disambiguates
+    using the (file, span) tuple.
     """
     files_dir = output_dir / "files"
     entries: list[dict[str, Any]] = []
