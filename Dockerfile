@@ -13,6 +13,10 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev --no-install-project
 
+# README.md is part of the package metadata (pyproject.toml -> readme).
+# uv sync --no-install-project skipped reading it; the second sync
+# (which installs the project itself) does, so it must be present.
+COPY README.md ./
 COPY src/ src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev
