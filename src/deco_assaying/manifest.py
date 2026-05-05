@@ -1,5 +1,7 @@
-"""Repo-level rollups: manifest.json, symbols.json, languages.json,
-errors.json, tree.json.
+"""Repo-level rollups: manifest.json, all_symbols.json,
+top_level_symbols.json, languages.json, errors.json, tree.json,
+plus the analysis_index.json sidecar that lists every artifact
+with its byte size and absolute download URL.
 
 These are written when an indexing job finishes. A consumer plans its
 ingestion order from the manifest without reading every per-file artifact;
@@ -26,23 +28,48 @@ def write(
     walk_result: WalkResult,
     elapsed_seconds: float,
 ) -> None:
-    """Write all five rollup files atomically."""
-    manifest = _build_manifest(
+    """Write every rollup atomically.
+
+    Order matters. We want the artifact-size index to know about
+    *every* artifact — including manifest.json — so consumers can
+    iterate it as a complete catalog. So:
+
+      1. Write the smaller rollups (languages, both symbols variants,
+         errors, tree).
+      2. Write `manifest.json` (so the index can stat it).
+      3. Build and write `analysis_index.json` last. Its presence
+         now serves as the completion sentinel — and because it
+         depends on every other artifact existing first, it's
+         strictly more reliable for that than manifest used to be.
+    """
+    manifest_payload = _build_manifest(
         job=job,
         file_summaries=file_summaries,
         walk_result=walk_result,
         elapsed_seconds=elapsed_seconds,
     )
     languages = _build_languages(file_summaries)
-    symbols = _build_symbols_index(output_dir, file_summaries)
+    all_symbols = _build_symbols_index(output_dir, file_summaries)
+    top_level_symbols = _filter_top_level_symbols(all_symbols)
     errors = _build_errors(file_summaries)
     tree = _build_tree(walk_result)
 
-    _write_atomic(output_dir / "manifest.json", manifest)
+    # 1. Smaller rollups.
     _write_atomic(output_dir / "languages.json", languages)
-    _write_atomic(output_dir / "symbols.json", symbols)
+    _write_atomic(output_dir / "all_symbols.json", all_symbols)
+    _write_atomic(output_dir / "top_level_symbols.json", top_level_symbols)
     _write_atomic(output_dir / "errors.json", errors)
     _write_atomic(output_dir / "tree.json", tree)
+
+    # 2. manifest.json — built before the index so the index can
+    # stat it and include it in the artifact list.
+    _write_atomic(output_dir / "manifest.json", manifest_payload)
+
+    # 3. analysis_index.json last — it's the completion sentinel
+    # and it lists every artifact in the dir (itself included, with
+    # size_bytes=null since we'd recurse on our own size).
+    analysis_index = _build_analysis_index(output_dir, job["job_id"])
+    _write_atomic(output_dir / "analysis_index.json", analysis_index)
 
 
 def _build_manifest(
@@ -181,6 +208,111 @@ def _build_tree(walk_result: WalkResult) -> dict[str, Any]:
             item["skip_reason"] = e.skip_reason
         entries.append(item)
     return {"entries": entries}
+
+
+def _filter_top_level_symbols(all_symbols: dict[str, Any]) -> dict[str, Any]:
+    """Drop entries that aren't module-level: anything dotted in the
+    qualified name (methods, nested classes, etc.) plus the synthetic
+    `module` rollup symbols some analyzers emit per file.
+
+    The cheap top-level-only view a context-window-conscious agent
+    reaches for first.
+    """
+    entries = [
+        e
+        for e in all_symbols.get("entries", [])
+        if "." not in e["qualified_name"] and e.get("kind") != "module"
+    ]
+    return {"entries": entries}
+
+
+def _build_analysis_index(output_dir: Path, job_id: str) -> dict[str, Any]:
+    """Stat every artifact in the job dir and return an index of
+    `{name, kind, size_bytes, url}` rows plus a bundle ZIP entry.
+
+    URLs are absolute, built from `config.PUBLIC_BASE_URL`. The
+    download API serves rollups/logs at `/outputs/{job_id}/<name>`
+    and per-file artifacts at `/outputs/{job_id}/file/<rel>`.
+    """
+    # Imported here (not at module top) to avoid a config-import cycle
+    # and keep this module's leaf-ness clean for fixtures that build
+    # WalkResult without setting up config.
+    from deco_assaying import config
+
+    base = config.PUBLIC_BASE_URL.rstrip("/")
+    job_url = f"{base}/outputs/{job_id}"
+
+    # Top-level rollups + log — the artifacts served at /outputs/{id}/<name>.
+    # `manifest.json` is included because we build this index *after*
+    # manifest is written (see the order documented in `write`).
+    rollup_names = [
+        "manifest.json",
+        "tree.json",
+        "all_symbols.json",
+        "top_level_symbols.json",
+        "languages.json",
+        "errors.json",
+        "log.jsonl",
+    ]
+    artifacts: list[dict[str, Any]] = []
+    for name in rollup_names:
+        path = output_dir / name
+        if not path.is_file():
+            # `log.jsonl` may not exist if the job had nothing to log
+            # (rare). Everything else is guaranteed to be there.
+            continue
+        artifacts.append(
+            {
+                "name": name,
+                "kind": "log" if name.endswith(".jsonl") else "rollup",
+                "size_bytes": path.stat().st_size,
+                "url": f"{job_url}/{name}",
+            }
+        )
+
+    # Self-entry. We can't stat ourselves before we exist on disk, and
+    # we don't want a two-pass write because the size of the second
+    # write would be slightly off from the size we recorded. So:
+    # `size_bytes: null` — honest about not knowing.
+    artifacts.append(
+        {
+            "name": "analysis_index.json",
+            "kind": "rollup",
+            "size_bytes": None,
+            "url": f"{job_url}/analysis_index.json",
+        }
+    )
+
+    # Per-file artifacts under files/.
+    files_dir = output_dir / "files"
+    if files_dir.is_dir():
+        for path in sorted(files_dir.rglob("*.json")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(output_dir).as_posix()  # files/src/foo.py.json
+            artifacts.append(
+                {
+                    "name": rel,
+                    "kind": "per_file",
+                    "size_bytes": path.stat().st_size,
+                    "url": f"{job_url}/file/{rel}",
+                }
+            )
+
+    # `total_size_bytes` excludes the self-entry (which has size_bytes=null).
+    total = sum(a["size_bytes"] for a in artifacts if a["size_bytes"] is not None)
+    return {
+        "job_id": job_id,
+        "public_base_url": base,
+        "outputs_path": f"/outputs/{job_id}",
+        "artifacts": artifacts,
+        "bundle": {
+            "url": f"{job_url}/zip",
+            "approx_size_bytes": None,
+            "note": "ZIP is generated on demand; size predicted only after generation.",
+        },
+        "total_size_bytes": total,
+    }
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:

@@ -7,90 +7,229 @@ base over many codebases.
 
 ## Run
 
-Pick the deployment that matches your situation:
+Five ways to run it. Pick whichever matches your situation.
 
-| Mode | Command | When to use |
-|---|---|---|
-| Daemon — pinned install | [`uv tool install`](#1-daemon--uv-tool-install-pypi) | You'll run it across many sessions; want it on `$PATH`. |
-| Daemon — ephemeral | [`uvx`](#2-daemon--uvx-no-install) | One-off run; don't want anything left on disk. |
-| Container | [`docker run` from GHCR](#3-docker--ghcr) | Ops deployment, compose stack, or want filesystem isolation. |
-| From source | [`uv run`](#4-from-source) | Hacking on the server itself. |
+| Mode | When to use |
+|---|---|
+| [1. uvx (one-off)](#1-one-off--uvx) | Try it once, no install. |
+| [2. uv tool install (pinned daemon)](#2-pinned-daemon--uv-tool-install) | Run it occasionally, want it on `$PATH`. |
+| [3. macOS LaunchAgent](#3-macos-persistent-daemon-launchd) | Persistent daemon on a Mac. |
+| [4. Linux systemd user unit](#4-linux-persistent-daemon-systemd) | Persistent daemon on Linux. |
+| [5. Docker / docker compose](#5-docker--ghcr) | Container deployment, ops stack, shared host. |
 
 ### Prereqs
 
-- **uv-based modes** need [`uv`](https://docs.astral.sh/uv/) and `git`.
+- **uv-based modes (1–4)** need [`uv`](https://docs.astral.sh/uv/) and `git`.
   uv ships a portable Python 3.13, so no system Python install required.
 
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
 
-- **Docker mode** needs `docker` (or compatible). The image bundles
+- **Docker mode (5)** needs `docker` (or compatible). The image bundles
   Python 3.13 and git; nothing else on the host.
 
-### 1. Daemon — `uv tool install` (PyPI)
-
-Installs the `deco-assaying` command on your `$PATH`, isolated in its
-own venv that uv manages.
+In every mode the server listens on `PORT` (default `35832`). Sanity-check
+it's up:
 
 ```bash
-uv tool install deco-assaying
-deco-assaying                     # starts the server
+curl http://127.0.0.1:35832/health
 ```
 
-Update later with `uv tool upgrade deco-assaying`; remove with
-`uv tool uninstall deco-assaying`.
+---
 
-### 2. Daemon — `uvx` (no install)
+### 1. One-off — `uvx`
 
-`uvx` resolves the package into a temporary venv and runs the entry
-point in one shot. Nothing persists between runs.
+`uvx` resolves the package into a temporary venv and runs it once.
+Nothing persists between runs.
 
 ```bash
 uvx deco-assaying                       # latest release
-uvx deco-assaying@0.1.0                 # pin a specific version
+uvx deco-assaying@0.1.5                 # pin a specific version
+
+# With env vars (e.g. private-repo token, custom output dir):
+PUBLIC_BASE_URL=http://localhost:35832 \
+GITHUB_TOKEN=ghp_xxx \
+OUTPUT_ROOT=$HOME/da-output \
+  uvx deco-assaying
 ```
 
-Good for kicking the tires or running on a CI box where you don't
-want to touch `~/.local/share/uv`.
+Good for kicking the tires or running on a CI box where you don't want
+to leave anything on disk.
 
-### 3. Docker / GHCR
+### 2. Pinned daemon — `uv tool install`
 
-Pull and run the published multi-arch image (linux/amd64 +
-linux/arm64):
+Installs the `deco-assaying` command on your `$PATH`, isolated in its
+own venv that uv manages. Faster startup than `uvx` (no resolve on
+each run).
+
+```bash
+uv tool install deco-assaying
+deco-assaying                           # foreground server
+```
+
+To upgrade later: `uv tool upgrade deco-assaying`.
+To remove: `uv tool uninstall deco-assaying`.
+
+To run in the background as your user (no init system):
+
+```bash
+nohup deco-assaying > ~/da.log 2>&1 &
+```
+
+For a real "always running" setup, see the launchd / systemd recipes
+below.
+
+### 3. macOS persistent daemon (launchd)
+
+After `uv tool install deco-assaying`, register a LaunchAgent so the
+daemon starts at login and restarts if it crashes.
+
+Save this as `~/Library/LaunchAgents/com.garycoding.deco-assaying.plist`
+(replace `CHANGE-ME` with your username):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.garycoding.deco-assaying</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/CHANGE-ME/.local/bin/deco-assaying</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OUTPUT_ROOT</key>
+    <string>/Users/CHANGE-ME/deco-assaying-output</string>
+    <key>PUBLIC_BASE_URL</key>
+    <string>http://localhost:35832</string>
+    <!-- Uncomment for private-repo access:
+    <key>GITHUB_TOKEN</key>
+    <string>ghp_xxx</string>
+    -->
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/CHANGE-ME/Library/Logs/deco-assaying.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/CHANGE-ME/Library/Logs/deco-assaying.err.log</string>
+</dict>
+</plist>
+```
+
+Load and start it:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.garycoding.deco-assaying.plist
+launchctl kickstart  -k gui/$(id -u)/com.garycoding.deco-assaying
+
+# Check status:
+launchctl print gui/$(id -u)/com.garycoding.deco-assaying | head -30
+
+# Tail logs:
+tail -f ~/Library/Logs/deco-assaying.{out,err}.log
+
+# Stop / unload:
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.garycoding.deco-assaying.plist
+```
+
+### 4. Linux persistent daemon (systemd)
+
+After `uv tool install deco-assaying`, register a user-scope systemd
+unit so no root is required.
+
+Save this as `~/.config/systemd/user/deco-assaying.service`:
+
+```ini
+[Unit]
+Description=deco-assaying MCP server
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/deco-assaying
+Restart=on-failure
+RestartSec=5
+Environment=OUTPUT_ROOT=%h/deco-assaying-output
+Environment=PUBLIC_BASE_URL=http://localhost:35832
+# Uncomment for private-repo access:
+# Environment=GITHUB_TOKEN=ghp_xxx
+# Environment=GITLAB_TOKEN=glpat-xxx
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now deco-assaying
+
+# Check status:
+systemctl --user status deco-assaying
+
+# Tail logs:
+journalctl --user -u deco-assaying -f
+
+# Stop:
+systemctl --user disable --now deco-assaying
+```
+
+To keep the daemon running when the user is logged out, enable lingering:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+### 5. Docker / GHCR
+
+Pull the published multi-arch image (linux/amd64 + linux/arm64) and
+run it directly:
 
 ```bash
 docker pull ghcr.io/garycoding/deco-assaying:latest
+
 docker run --rm \
   -p 35832:35832 \
+  -e PUBLIC_BASE_URL=http://localhost:35832 \
   -v deco-assaying-data:/data \
   ghcr.io/garycoding/deco-assaying:latest
 ```
 
-Pin a specific version with a tag — `:0.1.0`, `:0.1`, or `:latest`
-(see the [Releases](https://github.com/garycoding/deco-assaying/pkgs/container/deco-assaying)
-page on GHCR for the available tags).
+Pin a specific version with a tag — `:0.1.5`, `:0.1`, or `:latest`. See
+the [container registry](https://github.com/garycoding/deco-assaying/pkgs/container/deco-assaying)
+for available tags.
 
-Or with compose (see [docker-compose.yml](docker-compose.yml) — pulls
-the image, mounts a named volume at `/data`, restarts on failure):
-
-```bash
-docker compose up -d
-```
-
-The named volume `deco-assaying-data` persists job outputs across
-container restarts. To pass auth tokens for private repos:
+For a real deployment, copy [`docker-compose.yml`](docker-compose.yml),
+edit the `CHANGE-ME` placeholders (most importantly `PUBLIC_BASE_URL`),
+then:
 
 ```bash
-docker run --rm \
-  -e GITHUB_TOKEN=ghp_... \
-  -e GITLAB_TOKEN=glpat-... \
-  -p 35832:35832 \
-  -v deco-assaying-data:/data \
-  ghcr.io/garycoding/deco-assaying:latest
+docker compose up -d                    # start in background
+docker compose logs -f                  # tail logs
+docker compose pull && docker compose up -d   # upgrade
+docker compose down                     # stop, keep volume
+docker compose down -v                  # stop and drop the volume
 ```
 
-### 4. From source
+The compose file shows two volume options: a docker-managed named
+volume (default) or a bind mount to a host path you can browse
+directly. Switch by commenting / uncommenting the relevant lines.
+
+For a [Portainer](https://www.portainer.io/) stack, paste the contents
+of `docker-compose.yml` into the stack editor (lowercase stack name —
+Portainer rejects caps).
+
+### From source (for development)
 
 ```bash
 git clone https://github.com/garycoding/deco-assaying.git
@@ -99,51 +238,78 @@ uv sync
 uv run python -m deco_assaying
 ```
 
-### Endpoints
+## Endpoints
 
-In every mode the server listens on `PORT` (default `35832`) with:
-
-- `POST /sse` — MCP Streamable HTTP transport.
+- `POST /sse` — MCP Streamable HTTP transport. Tools, prompts.
 - `GET /health` — liveness probe.
 - `GET /admin/*` — read-only JSON ops endpoints.
 - `GET /outputs/{job_id}/...` — read-only download API for job artifacts.
 - `GET /docs` — OpenAPI / Swagger UI for the HTTP API.
 
-Sanity-check it's up:
-
-```bash
-curl http://127.0.0.1:35832/health
-```
+HTTP responses are gzipped when the client sends `Accept-Encoding: gzip`
+(transparent for any modern client).
 
 ## MCP tools
 
-- `analyze_file(content, filename?, language?, options?)` — parse a single
-  file passed inline; returns structural JSON.
-- `index_repo(source, options?)` — start a job that indexes a whole repo
-  and writes per-file artifacts plus a manifest. The server allocates a
-  fresh output dir under `OUTPUT_ROOT` and returns `{ job_id, output_path }`.
-  `source` can be a local directory, a GitHub URL
-  (`https://github.com/owner/repo`), or a GitLab URL
-  (`https://gitlab.com/owner/repo`, including nested groups
-  `https://gitlab.com/group/sub/repo`). Pass `git_ref` to pick a specific
-  branch / tag / sha.
-- `get_job_status(job_id)` — poll a running or completed job.
+The MCP server exposes a small surface; descriptions in the tools'
+schemas explain the recommended order of use. Highlights:
+
+- `analyze_file(content, filename?, language?, ...)` — analyze ONE file
+  whose source you already have, inline. Don't use this to analyze a
+  whole repo.
+- `index_repo(source, options?)` — start an async indexing job. Returns
+  `{job_id}`. `source` can be a local directory, a GitHub URL, or a
+  GitLab URL (including nested groups).
+- `get_job_status(job_id)` — poll until `state == "done"`.
 - `cancel_job(job_id)` — cooperative cancel.
-- `list_supported_languages()` — capability discovery.
-- `detect_language(path)` — extension/shebang detection helper.
+- `get_manifest(job_id)` — repo-level summary. Read first.
+- `get_analysis_index(job_id)` — sizes + absolute download URLs for
+  every analysis file. Read second to plan which artifacts to fetch
+  and which (if any) to side-route via a fetch tool to avoid
+  context-window overflow.
+- `get_top_level_symbols(job_id, ...)` — module-level definitions only.
+  The cheap default for understanding repo shape.
+- `get_all_symbols(job_id, ...)` — every definition (including methods
+  + nested classes). Heavier; use for cross-cutting "find every X"
+  queries.
+- `get_tree(job_id, path_prefix?, analyzed_only?)` — full path inventory
+  with size totals.
+- `get_languages(job_id)` / `get_errors(job_id)` — small rollups.
+- `list_job_files(job_id, glob?)` — paths of every per-file artifact.
+- `get_file_analysis(job_id, path, sections?)` — drill into one file's
+  analysis. Pass `sections=` to skip the chunks payload.
+- `get_log_events(job_id, ...)` — tail the run log (during or after).
+- `list_supported_languages()` / `detect_language(path)` — capability
+  helpers.
+
+## MCP prompts (workflow templates)
+
+The server ships two prompts so any client picking it up inherits the
+recommended workflow without reading this README:
+
+- `analyze_repo(source, focus?)` — full lifecycle from scratch.
+- `explore_finished_job(job_id, question)` — focused question against
+  a finished job.
+
+Both explain the URL-fallback strategy: when an artifact is too big
+for the context window, an agent paired with a generic HTTP fetch
+tool can hand its absolute `url` (from `analysis_index.json`) to
+out-of-band processing instead of inlining the raw content.
 
 ## Output download API
 
 Every job's artifacts land under `OUTPUT_ROOT/{job_id}/`. A consumer
 sharing the volume can read them off disk; one without a shared volume
-can pull them over HTTP:
+pulls them over HTTP:
 
 | Endpoint | Returns |
 |---|---|
 | `GET /outputs/{job_id}` | `manifest.json` (convenience). |
 | `GET /outputs/{job_id}/manifest.json` | Repo-level rollup. |
+| `GET /outputs/{job_id}/analysis_index.json` | Sizes + absolute URLs for every artifact. |
 | `GET /outputs/{job_id}/tree.json` | Full path inventory (analyzed + skipped). |
-| `GET /outputs/{job_id}/symbols.json` | Global qualified-name index. |
+| `GET /outputs/{job_id}/all_symbols.json` | Every definition. |
+| `GET /outputs/{job_id}/top_level_symbols.json` | Module-level definitions only. |
 | `GET /outputs/{job_id}/languages.json` | Per-language counts. |
 | `GET /outputs/{job_id}/errors.json` | Parse errors + skipped files. |
 | `GET /outputs/{job_id}/log.jsonl?from_offset=N` | Tail the job's log. |
@@ -199,11 +365,14 @@ the only on-disk cost is the output artifacts.
 | `HOST` | `0.0.0.0` | `0.0.0.0` | HTTP bind address. |
 | `OUTPUT_ROOT` | `./output` | `/data` | Where the server writes job dirs. |
 | `OUTPUT_EXPIRY_DAYS` | `7` | `7` | Auto-purge job dirs older than this. `0` disables. |
+| `PUBLIC_BASE_URL` | `http://localhost:${PORT}` ¹ | `http://localhost:${PORT}` ¹ | Externally-reachable URL of this daemon, used to build absolute download URLs in `analysis_index.json`. Override in any deployment where clients reach the server at a different address. |
 | `JOB_HISTORY_MAX` | `100` | `100` | In-memory job-table cap. |
 | `DEFAULT_MAX_FILE_BYTES` | `2097152` | `2097152` | Default per-file size cap. |
 | `DEFAULT_CHUNK_MAX_TOKENS` | `800` | `800` | Default chunk size for cAST chunking. |
-| `GITHUB_TOKEN` | unset | unset | Optional, raises GitHub Trees API quota from 60 to 5000 req/hr and unlocks private repos. |
-| `GITLAB_TOKEN` | unset | unset | Optional, used for GitLab API auth and private-repo access. |
+| `GITHUB_TOKEN` | unset | unset | Optional. Raises GitHub Trees API quota from 60 to 5000 req/hr and unlocks private repos. |
+| `GITLAB_TOKEN` | unset | unset | Optional. GitLab API auth + private-repo access. |
+
+¹ The `PUBLIC_BASE_URL` default is built from `PORT` at startup. If you set `PORT=8080` without setting `PUBLIC_BASE_URL`, the default becomes `http://localhost:8080`.
 
 ## Releasing
 

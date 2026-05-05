@@ -245,10 +245,12 @@ def test_mcp_tools_list(client: TestClient):
         "cancel_job",
         "get_manifest",
         "get_tree",
-        "get_symbols",
+        "get_top_level_symbols",
+        "get_all_symbols",
         "get_languages",
         "get_errors",
         "get_file_analysis",
+        "get_analysis_index",
         "list_job_files",
         "get_log_events",
         "list_supported_languages",
@@ -453,7 +455,7 @@ def test_mcp_index_repo_clones_public_github(client: TestClient, output_root: Pa
     assert "pyproject.toml" in paths
     assert "README.md" in paths
 
-    # symbols.json picks up our own code.
-    symbols = json.loads((out / "symbols.json").read_text())
+    # all_symbols.json picks up our own code.
+    symbols = json.loads((out / "all_symbols.json").read_text())
     qnames = {e["qualified_name"] for e in symbols["entries"]}
     assert "analyze_inline" in qnames

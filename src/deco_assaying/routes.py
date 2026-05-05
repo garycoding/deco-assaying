@@ -20,7 +20,7 @@ from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import BaseModel
 
-from deco_assaying import analyze, jobs, languages, outputs, retention
+from deco_assaying import analyze, jobs, languages, outputs, prompts, retention
 from deco_assaying.config import JOB_HISTORY_MAX, VERSION
 
 
@@ -57,9 +57,9 @@ async def list_tools() -> list[types.Tool]:
                 "parse status. The server does not read from disk. "
                 "DO NOT use this to analyze a whole repository — call "
                 "index_repo instead, then read the rollups with "
-                "get_manifest, get_tree, get_symbols, etc. Never invent "
-                "file contents to pass here; if you don't have actual "
-                "source code in hand, don't call this tool."
+                "get_manifest, get_tree, get_top_level_symbols, etc. "
+                "Never invent file contents to pass here; if you don't "
+                "have actual source code in hand, don't call this tool."
             ),
             inputSchema={
                 "type": "object",
@@ -113,11 +113,12 @@ async def list_tools() -> list[types.Tool]:
                 "{job_id} immediately — do not wait inline. Poll "
                 'get_job_status until state == "done", then read the '
                 "results via the artifact-fetch tools: get_manifest, "
-                "get_tree, get_symbols, get_languages, get_errors, "
-                "list_job_files, and get_file_analysis. "
-                "Use this — not analyze_file — for any whole-repo "
-                "question. See this tool's input schema for tunable "
-                "parameters."
+                "get_analysis_index (sizes + URLs for everything), "
+                "get_tree, get_top_level_symbols, get_all_symbols, "
+                "get_languages, get_errors, list_job_files, and "
+                "get_file_analysis. Use this — not analyze_file — for "
+                "any whole-repo question. See this tool's input "
+                "schema for tunable parameters."
             ),
             inputSchema={
                 "type": "object",
@@ -276,12 +277,17 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
-            name="get_symbols",
+            name="get_top_level_symbols",
             description=(
-                "Return the global symbol index — qualified-name → "
-                "(file, span, kind). Filter by qualified-name prefix, "
-                "symbol kind, and/or file-path prefix to keep responses "
-                "small. Filters combine with AND."
+                "Return the **module-level** symbol index — only "
+                "definitions at the top of each file (no methods, no "
+                "nested classes, no synthetic module rollups). This "
+                "is the cheap default for understanding repo shape; "
+                "reach for it first. For finer-grained queries (a "
+                "specific method, every nested helper) use "
+                "get_all_symbols. Same response shape and the same "
+                "prefix / kind / file_prefix filters as get_all_symbols; "
+                "all combine with AND."
             ),
             inputSchema={
                 "type": "object",
@@ -289,7 +295,47 @@ async def list_tools() -> list[types.Tool]:
                     "job_id": {"type": "string"},
                     "prefix": {
                         "type": "string",
-                        "description": 'Qualified-name prefix (e.g. "src.auth."). Empty = no filter.',
+                        "description": 'Qualified-name prefix (e.g. "Auth"). Empty = no filter.',
+                        "default": "",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": (
+                            "Symbol kind — one of class, interface, struct, "
+                            "enum, function, constant, type_alias, decorator, "
+                            "macro. (`module` and `method` won't appear here "
+                            "by definition.) Empty = no filter."
+                        ),
+                        "default": "",
+                    },
+                    "file_prefix": {
+                        "type": "string",
+                        "description": 'Source-path prefix (e.g. "src/auth/"). Empty = no filter.',
+                        "default": "",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_all_symbols",
+            description=(
+                "Return every definition across every analyzed file — "
+                "module-level entries plus methods, nested classes, "
+                "and synthetic module rollups. Use this for "
+                'cross-cutting queries ("find every Handler", '
+                '"list every method named `m`"). For repo-shape '
+                "questions, prefer get_top_level_symbols — it's "
+                "much cheaper. Filter by qualified-name prefix, "
+                "symbol kind, and/or file-path prefix; filters AND."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "prefix": {
+                        "type": "string",
+                        "description": 'Qualified-name prefix (e.g. "Foo.bar"). Empty = no filter.',
                         "default": "",
                     },
                     "kind": {
@@ -308,6 +354,29 @@ async def list_tools() -> list[types.Tool]:
                         "default": "",
                     },
                 },
+                "required": ["job_id"],
+            },
+        ),
+        types.Tool(
+            name="get_analysis_index",
+            description=(
+                "Return the artifact index for a finished job: every "
+                "analysis file the server produced, with its byte size "
+                "and an absolute download URL. Read this AFTER "
+                "get_manifest to plan which artifacts to fetch — "
+                "especially on large repos where some payloads exceed "
+                "the context window. Each artifact's `url` lets the "
+                "agent route around the prompt entirely: hand a URL "
+                "to a fetch tool, process the file out-of-band, and "
+                "feed only the distilled result back into the prompt. "
+                "Big artifacts can therefore inform reasoning without "
+                "ever overflowing context. Includes both "
+                "`all_symbols.json` and `top_level_symbols.json` so "
+                "the agent can size up the cheaper view at a glance."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
                 "required": ["job_id"],
             },
         ),
@@ -498,10 +567,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         if name in {
             "get_manifest",
             "get_tree",
-            "get_symbols",
+            "get_all_symbols",
+            "get_top_level_symbols",
             "get_languages",
             "get_errors",
             "get_file_analysis",
+            "get_analysis_index",
             "list_job_files",
             "get_log_events",
         }:
@@ -515,6 +586,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                     return _ok(outputs.read_languages(jd))
                 if name == "get_errors":
                     return _ok(outputs.read_errors(jd))
+                if name == "get_analysis_index":
+                    return _ok(outputs.read_analysis_index(jd))
                 if name == "get_tree":
                     return _ok(
                         outputs.read_tree(
@@ -523,9 +596,18 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                             analyzed_only=bool(arguments.get("analyzed_only", False)),
                         )
                     )
-                if name == "get_symbols":
+                if name == "get_all_symbols":
                     return _ok(
-                        outputs.read_symbols(
+                        outputs.read_all_symbols(
+                            jd,
+                            prefix=arguments.get("prefix") or "",
+                            kind=arguments.get("kind") or "",
+                            file_prefix=arguments.get("file_prefix") or "",
+                        )
+                    )
+                if name == "get_top_level_symbols":
+                    return _ok(
+                        outputs.read_top_level_symbols(
                             jd,
                             prefix=arguments.get("prefix") or "",
                             kind=arguments.get("kind") or "",
@@ -574,6 +656,20 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return _ok({"error": "not_implemented", "detail": str(e)})
 
     raise ValueError(f"Unknown tool: {name}")
+
+
+# ---------------------------------------------------------------------------
+# MCP prompts — workflow templates the server ships alongside its tools.
+
+
+@mcp.list_prompts()
+async def list_prompts() -> list[types.Prompt]:
+    return prompts.list_prompts()
+
+
+@mcp.get_prompt()
+async def get_prompt(name: str, arguments: dict[str, str] | None = None) -> types.GetPromptResult:
+    return prompts.get_prompt(name, arguments)
 
 
 # ---------------------------------------------------------------------------
@@ -761,9 +857,19 @@ async def outputs_tree(job_id: str) -> FileResponse:
     return _serve_named_json(job_id, "tree.json")
 
 
-@router.get("/outputs/{job_id}/symbols.json", tags=["outputs"])
-async def outputs_symbols(job_id: str) -> FileResponse:
-    return _serve_named_json(job_id, "symbols.json")
+@router.get("/outputs/{job_id}/all_symbols.json", tags=["outputs"])
+async def outputs_all_symbols(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "all_symbols.json")
+
+
+@router.get("/outputs/{job_id}/top_level_symbols.json", tags=["outputs"])
+async def outputs_top_level_symbols(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "top_level_symbols.json")
+
+
+@router.get("/outputs/{job_id}/analysis_index.json", tags=["outputs"])
+async def outputs_analysis_index(job_id: str) -> FileResponse:
+    return _serve_named_json(job_id, "analysis_index.json")
 
 
 @router.get("/outputs/{job_id}/languages.json", tags=["outputs"])

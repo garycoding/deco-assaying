@@ -75,7 +75,14 @@ def test_outputs_root_serves_manifest(client: TestClient, finished_job):
 
 def test_outputs_named_files(client: TestClient, finished_job):
     job_id, _ = finished_job
-    for name in ("manifest.json", "tree.json", "symbols.json", "languages.json"):
+    for name in (
+        "manifest.json",
+        "tree.json",
+        "all_symbols.json",
+        "top_level_symbols.json",
+        "languages.json",
+        "analysis_index.json",
+    ):
         r = client.get(f"/outputs/{job_id}/{name}")
         assert r.status_code == 200, f"{name}: {r.status_code} {r.text[:200]!r}"
         assert r.headers["content-type"].startswith("application/json")
@@ -90,6 +97,32 @@ def test_outputs_log(client: TestClient, finished_job):
     assert body["next_offset"] > 0
     events = {e["event"] for e in body["events"]}
     assert "manifest_written" in events
+
+
+def test_outputs_gzip_when_client_opts_in(client: TestClient, finished_job):
+    """Client sends Accept-Encoding: gzip → server responds with
+    Content-Encoding: gzip for any JSON ≥ 1 KB. The per-file
+    analysis for alpha.py includes the full `chunks` payload which
+    comfortably exceeds the threshold."""
+    job_id, _ = finished_job
+    r = client.get(
+        f"/outputs/{job_id}/file/files/alpha.py.json",
+        headers={"Accept-Encoding": "gzip"},
+    )
+    assert r.status_code == 200
+    assert r.headers.get("content-encoding") == "gzip"
+
+
+def test_outputs_no_gzip_when_client_does_not_opt_in(client: TestClient, finished_job):
+    """No Accept-Encoding header → no gzip layer (Starlette's
+    GZipMiddleware respects the client's preferences)."""
+    job_id, _ = finished_job
+    r = client.get(
+        f"/outputs/{job_id}/file/files/alpha.py.json",
+        headers={"Accept-Encoding": "identity"},
+    )
+    assert r.status_code == 200
+    assert r.headers.get("content-encoding") != "gzip"
 
 
 def test_outputs_unknown_job_404(client: TestClient, output_root: Path):

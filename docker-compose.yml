@@ -1,22 +1,65 @@
+# deco-assaying — example compose stack.
+#
+# Copy this file, change the values marked CHANGE-ME, then:
+#   docker compose up -d
+#
+# To upgrade:
+#   docker compose pull && docker compose up -d
+#
+# To stop and clean:
+#   docker compose down            # keeps the named volume
+#   docker compose down -v         # also drops the named volume
+
 services:
   deco-assaying:
     image: ghcr.io/garycoding/deco-assaying:latest
     container_name: deco-assaying
     restart: unless-stopped
+
+    # Host port 35832 → container port 35832. Change the LEFT side if
+    # you need a different external port (e.g. "8080:35832").
     ports:
       - "35832:35832"
-    volumes:
-      - deco-assaying-data:/data
+
     environment:
+      # Where the server writes per-job artifacts inside the container.
+      # Match the volume mount below.
       OUTPUT_ROOT: /data
+
+      # Auto-purge job dirs older than this many days. 0 disables.
       OUTPUT_EXPIRY_DAYS: "7"
-      # Uncomment to authenticate to private repos / raise rate limits:
-      # GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      # GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+
+      # CHANGE-ME: the externally-reachable URL of this daemon.
+      # Used to build absolute download URLs in analysis_index.json
+      # so consumers (and any LLM fetch tools) get clickable links.
+      # Examples:
+      #   PUBLIC_BASE_URL: "http://192.168.1.50:35832"
+      #   PUBLIC_BASE_URL: "https://deco.example.com"
+      PUBLIC_BASE_URL: "http://CHANGE-ME:35832"
+
+      # Optional: tokens for private repos / higher rate limits.
+      # Either set them in your shell and let compose forward them
+      # (the ${VAR:-} form), or paste the literal token in.
+      # GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      # GITLAB_TOKEN: "${GITLAB_TOKEN:-}"
+
+    volumes:
+      # Default: a docker-managed named volume. Survives `docker
+      # compose down`, lives at /var/lib/docker/volumes/<stack>_deco-assaying-data/_data.
+      - deco-assaying-data:/data
+
+      # OR — bind-mount a host directory you can browse directly.
+      # Comment out the line above and uncomment this one. Make sure
+      # the host directory exists (mkdir -p /srv/deco-assaying-output).
+      # The container runs as root, so files appear root-owned on the
+      # host; sudo to read or to clean up.
+      # - /srv/deco-assaying-output:/data
+
     extra_hosts:
-      # Lets the consumer running on the docker host reach the server
-      # under host.docker.internal on Linux too.
+      # Lets a consumer on the docker host reach the server via
+      # host.docker.internal on Linux (works out of the box on Mac/Windows).
       - "host.docker.internal:host-gateway"
 
 volumes:
+  # Only needed if you stick with the named-volume option above.
   deco-assaying-data:

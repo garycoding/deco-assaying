@@ -12,6 +12,21 @@ except PackageNotFoundError:  # editable install before first build
 PORT = int(os.environ.get("PORT", "35832"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 
+# Externally-reachable base URL of this daemon. Used to build absolute
+# download URLs in `analysis_index.json` so consumers can fetch
+# artifacts (or hand them to a separate fetch tool) without the
+# daemon having to know how it's being reached.
+#
+# Default is good for local dev. In container/server deployments,
+# set this to the URL clients actually use:
+#   PUBLIC_BASE_URL=http://da.lan:35832
+#   PUBLIC_BASE_URL=https://deco.example.com
+#
+# Misconfiguration won't break the daemon — the URLs in the index will
+# just point at the wrong place; consumers can recover by composing
+# URLs themselves from the `outputs_path` field.
+PUBLIC_BASE_URL: str = (os.environ.get("PUBLIC_BASE_URL") or f"http://localhost:{PORT}").rstrip("/")
+
 # Where the server allocates per-job output directories. Each job gets
 # `OUTPUT_ROOT/{job_id}/` with the manifest, log, files/, etc. The
 # server always picks the path itself; callers never supply one. In

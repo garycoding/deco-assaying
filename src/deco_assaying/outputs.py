@@ -246,7 +246,10 @@ def _dir_size(path: Path) -> int:
 
 
 def _load_json(job_dir: Path, name: str) -> Any:
-    path = job_dir / name
+    # `name` is hardcoded by every current caller, but route through
+    # `safe_subpath` anyway — costs nothing and means a future caller
+    # passing user-supplied input can't sneak a traversal in.
+    path = safe_subpath(job_dir, name)
     if not path.is_file():
         raise ArtifactMissing(f"{name} not present (job not done yet?)")
     with open(path, encoding="utf-8") as f:
@@ -308,16 +311,17 @@ def read_tree(
     }
 
 
-def read_symbols(
+def _read_filtered_symbols(
     job_dir: Path,
+    artifact_name: str,
     *,
-    prefix: str = "",
-    kind: str = "",
-    file_prefix: str = "",
+    prefix: str,
+    kind: str,
+    file_prefix: str,
 ) -> dict[str, Any]:
-    """`symbols.json` with optional qualified-name-prefix, kind, and
-    file-prefix filters. All three combine (AND)."""
-    raw = _load_json(job_dir, "symbols.json")
+    """Shared body for `read_all_symbols` and `read_top_level_symbols`.
+    Same filter logic, different on-disk file."""
+    raw = _load_json(job_dir, artifact_name)
     entries = raw.get("entries", [])
     if prefix:
         entries = [e for e in entries if e["qualified_name"].startswith(prefix)]
@@ -332,6 +336,53 @@ def read_symbols(
         "total_in_repo": len(raw.get("entries", [])),
         "total_returned": len(entries),
     }
+
+
+def read_all_symbols(
+    job_dir: Path,
+    *,
+    prefix: str = "",
+    kind: str = "",
+    file_prefix: str = "",
+) -> dict[str, Any]:
+    """`all_symbols.json` — every definition across every analyzed
+    file (including methods, nested classes, and synthetic module
+    rollups). Filterable by qualified-name prefix, kind, and/or
+    file-path prefix; filters AND-combine."""
+    return _read_filtered_symbols(
+        job_dir,
+        "all_symbols.json",
+        prefix=prefix,
+        kind=kind,
+        file_prefix=file_prefix,
+    )
+
+
+def read_top_level_symbols(
+    job_dir: Path,
+    *,
+    prefix: str = "",
+    kind: str = "",
+    file_prefix: str = "",
+) -> dict[str, Any]:
+    """`top_level_symbols.json` — the cheap view: only module-level
+    definitions (no dot in qualified_name, kind != "module"). Same
+    filter args and response shape as `read_all_symbols`."""
+    return _read_filtered_symbols(
+        job_dir,
+        "top_level_symbols.json",
+        prefix=prefix,
+        kind=kind,
+        file_prefix=file_prefix,
+    )
+
+
+def read_analysis_index(job_dir: Path) -> dict[str, Any]:
+    """`analysis_index.json` — sizes + URLs for every artifact this
+    job produced. Read after `manifest.json` to plan which artifacts
+    to fetch (especially on large repos where some payloads exceed
+    the LLM's context window)."""
+    return _load_json(job_dir, "analysis_index.json")
 
 
 _FILE_ANALYSIS_SECTIONS = (

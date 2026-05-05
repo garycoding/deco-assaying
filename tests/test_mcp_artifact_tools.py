@@ -185,31 +185,106 @@ def test_mcp_get_tree_analyzed_only(client, finished_job):
 
 
 # ---------------------------------------------------------------------------
-# get_symbols — global index + filters
+# get_all_symbols + get_top_level_symbols
 
 
-def test_mcp_get_symbols_no_filter(client, finished_job):
+def test_mcp_get_all_symbols_no_filter(client, finished_job):
     sid = _initialize(client)
     job_id, _ = finished_job
-    payload = _call(client, sid, "get_symbols", {"job_id": job_id})
+    payload = _call(client, sid, "get_all_symbols", {"job_id": job_id})
     qnames = {e["qualified_name"] for e in payload["entries"]}
     assert "hello" in qnames
     assert any(q.startswith("Beta") for q in qnames)
 
 
-def test_mcp_get_symbols_kind_filter(client, finished_job):
+def test_mcp_get_all_symbols_kind_filter(client, finished_job):
     sid = _initialize(client)
     job_id, _ = finished_job
-    payload = _call(client, sid, "get_symbols", {"job_id": job_id, "kind": "class"})
+    payload = _call(client, sid, "get_all_symbols", {"job_id": job_id, "kind": "class"})
     assert all(e["kind"] == "class" for e in payload["entries"])
     assert payload["total_returned"] < payload["total_in_repo"]
 
 
-def test_mcp_get_symbols_file_prefix(client, finished_job):
+def test_mcp_get_all_symbols_file_prefix(client, finished_job):
     sid = _initialize(client)
     job_id, _ = finished_job
-    payload = _call(client, sid, "get_symbols", {"job_id": job_id, "file_prefix": "pkg/"})
+    payload = _call(client, sid, "get_all_symbols", {"job_id": job_id, "file_prefix": "pkg/"})
     assert all(e["file"].startswith("pkg/") for e in payload["entries"])
+
+
+def test_mcp_get_top_level_symbols(client, finished_job):
+    """Top-level view: no dotted qualified_names, no module-kind entries.
+    `hello` (top-level fn in alpha.py) shows up; `Beta.m` (method) does not."""
+    sid = _initialize(client)
+    job_id, _ = finished_job
+    payload = _call(client, sid, "get_top_level_symbols", {"job_id": job_id})
+    qnames = {e["qualified_name"] for e in payload["entries"]}
+    assert "hello" in qnames
+    assert all("." not in q for q in qnames)
+    assert all(e.get("kind") != "module" for e in payload["entries"])
+
+
+def test_mcp_get_top_level_symbols_smaller_than_all(client, finished_job):
+    """The cheap-view file is strictly smaller than the all-symbols file."""
+    sid = _initialize(client)
+    job_id, _ = finished_job
+    top = _call(client, sid, "get_top_level_symbols", {"job_id": job_id})
+    full = _call(client, sid, "get_all_symbols", {"job_id": job_id})
+    assert top["total_in_repo"] <= full["total_in_repo"]
+
+
+def test_mcp_get_top_level_symbols_filters(client, finished_job):
+    sid = _initialize(client)
+    job_id, _ = finished_job
+    payload = _call(
+        client,
+        sid,
+        "get_top_level_symbols",
+        {"job_id": job_id, "file_prefix": "pkg/"},
+    )
+    assert all(e["file"].startswith("pkg/") for e in payload["entries"])
+
+
+# ---------------------------------------------------------------------------
+# get_analysis_index
+
+
+def test_mcp_get_analysis_index(client, finished_job):
+    sid = _initialize(client)
+    job_id, _ = finished_job
+    payload = _call(client, sid, "get_analysis_index", {"job_id": job_id})
+    assert payload["job_id"] == job_id
+    assert payload["public_base_url"].startswith("http")
+    names = {a["name"] for a in payload["artifacts"]}
+    # Both symbols variants are listed; the agent can compare sizes.
+    assert "all_symbols.json" in names
+    assert "top_level_symbols.json" in names
+    assert "tree.json" in names
+    # The index lists manifest.json (consumers iterating artifacts get a complete catalog).
+    assert "manifest.json" in names
+    # The index lists itself with size_bytes=null (we'd recurse on our own size).
+    assert "analysis_index.json" in names
+    self_entry = next(a for a in payload["artifacts"] if a["name"] == "analysis_index.json")
+    assert self_entry["size_bytes"] is None
+    # Per-file artifacts are listed too.
+    assert any(a["name"].startswith("files/") for a in payload["artifacts"])
+    # Sizes are real (where present) and URLs are absolute.
+    assert all(a["size_bytes"] is None or a["size_bytes"] > 0 for a in payload["artifacts"])
+    assert all(a["url"].startswith(payload["public_base_url"]) for a in payload["artifacts"])
+    # Bundle ZIP entry.
+    assert payload["bundle"]["url"].endswith("/zip")
+    # total_size_bytes excludes the self-entry (which is null).
+    assert payload["total_size_bytes"] > 0
+
+
+def test_mcp_analysis_index_top_level_smaller_than_all_on_disk(client, finished_job):
+    """The on-disk top_level_symbols.json is smaller than all_symbols.json
+    — caller can read sizes directly from the index without downloading."""
+    sid = _initialize(client)
+    job_id, _ = finished_job
+    payload = _call(client, sid, "get_analysis_index", {"job_id": job_id})
+    by_name = {a["name"]: a for a in payload["artifacts"]}
+    assert by_name["top_level_symbols.json"]["size_bytes"] <= by_name["all_symbols.json"]["size_bytes"]
 
 
 # ---------------------------------------------------------------------------
@@ -297,9 +372,11 @@ def test_mcp_get_file_analysis_path_traversal(client, finished_job):
     [
         ("get_manifest", {}),
         ("get_tree", {}),
-        ("get_symbols", {}),
+        ("get_all_symbols", {}),
+        ("get_top_level_symbols", {}),
         ("get_languages", {}),
         ("get_errors", {}),
+        ("get_analysis_index", {}),
         ("list_job_files", {}),
         ("get_file_analysis", {"path": "x.py"}),
         ("get_log_events", {}),

@@ -82,11 +82,36 @@ def test_index_repo_against_local_fixture(tmp_path: Path, output_root: Path):
     assert alpha["module_doc"] == "alpha doc."
     assert any(s["qualified_name"] == "hello" for s in alpha["symbols"])
 
-    # symbols.json and languages.json wrote.
-    symbols = json.loads((output_path / "symbols.json").read_text())
+    # all_symbols.json and languages.json wrote.
+    symbols = json.loads((output_path / "all_symbols.json").read_text())
     qnames = {e["qualified_name"] for e in symbols["entries"]}
     assert "hello" in qnames
     assert any(q.startswith("Beta") for q in qnames)
+
+    # top_level_symbols.json is the cheap-view sibling — same shape,
+    # methods/nested entries filtered out.
+    top_level = json.loads((output_path / "top_level_symbols.json").read_text())
+    top_qnames = {e["qualified_name"] for e in top_level["entries"]}
+    assert "hello" in top_qnames
+    # Methods (e.g. `Beta.m` from pkg/beta.py) are dotted and should be absent.
+    assert all("." not in q for q in top_qnames)
+    # The filtered view is strictly smaller.
+    assert len(top_level["entries"]) <= len(symbols["entries"])
+
+    # analysis_index.json catalogs every artifact with size + URL,
+    # including manifest.json and itself (with size_bytes=null for the
+    # self-entry to avoid the recursive-size problem).
+    index = json.loads((output_path / "analysis_index.json").read_text())
+    names = {a["name"] for a in index["artifacts"]}
+    assert {
+        "manifest.json",
+        "all_symbols.json",
+        "top_level_symbols.json",
+        "tree.json",
+        "analysis_index.json",
+    } <= names
+    assert all(a["size_bytes"] is None or a["size_bytes"] > 0 for a in index["artifacts"])
+    assert all(a["url"].startswith("http") for a in index["artifacts"])
 
     languages = json.loads((output_path / "languages.json").read_text())
     assert "python" in languages["languages"]

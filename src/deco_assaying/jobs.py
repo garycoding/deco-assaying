@@ -16,8 +16,11 @@ spawns a background thread that drives the work. The thread:
 5. As completions arrive, atomically writes
    `output_dir/files/<rel>.json`, appends an event to
    `output_dir/log.jsonl`, and updates the live job entry's counters.
-6. On finish: builds the rollups (`manifest.json`, `symbols.json`,
-   `languages.json`, `errors.json`) and flips status to `done`.
+6. On finish: builds the rollups (`manifest.json`, `tree.json`,
+   `all_symbols.json`, `top_level_symbols.json`, `languages.json`,
+   `errors.json`) plus the `analysis_index.json` sidecar that lists
+   every artifact with its byte size and absolute download URL.
+   Flips status to `done`.
 
 Cancellation is cooperative: `cancel(job_id)` sets `_cancel=True`. The
 orchestrator stops submitting new files between completions; the workers
