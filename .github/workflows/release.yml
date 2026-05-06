@@ -10,7 +10,38 @@ permissions:
   id-token: write       # PyPI trusted publishing
 
 jobs:
+  # Pre-flight checks. Both publish jobs depend on this, so a failed gate
+  # prevents *any* artifact from shipping (no half-shipped state).
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history needed for the ancestor check below
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Verify tag matches pyproject version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PROJECT_VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG" != "$PROJECT_VERSION" ]; then
+            echo "tag $TAG != pyproject $PROJECT_VERSION"
+            exit 1
+          fi
+
+      - name: Verify tag is reachable from origin/main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tagged commit $GITHUB_SHA is not on origin/main"
+            echo "release tags must come from main — back-merge through, then re-tag from main"
+            exit 1
+          fi
+
   docker:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +81,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   pypi:
+    needs: gate
     runs-on: ubuntu-latest
     environment: pypi   # matches the trusted-publisher config on PyPI
     steps:
@@ -57,15 +89,6 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
-
-      - name: Verify tag matches pyproject version
-        run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          PROJECT_VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          if [ "$TAG" != "$PROJECT_VERSION" ]; then
-            echo "tag $TAG != pyproject $PROJECT_VERSION"
-            exit 1
-          fi
 
       - name: Build wheel + sdist
         run: uv build
