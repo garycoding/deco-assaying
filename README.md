@@ -376,13 +376,14 @@ the only on-disk cost is the output artifacts.
 
 ## Releasing
 
-Tag-driven. Bump `version` in `pyproject.toml`, then:
+Tag-driven via the `Release` workflow on push of a `v*` tag. Use the [`ParkviewLab/dev-tools`](https://github.com/ParkviewLab/dev-tools) helpers — they enforce the SSOT-tag-CI loop (`pyproject.toml` is the only place the version lives; the workflow's `Verify tag matches pyproject version` step would fail otherwise).
 
-```bash
-git tag vX.Y.Z && git push --tags
+```sh
+git bump patch              # 0.1.5 → 0.1.6, committed
+git release                 # annotated tag v0.1.6 from pyproject.toml
+git push --follow-tags      # CI fires
 ```
 
-The `Release` workflow builds a multi-arch image (linux/amd64 +
-linux/arm64) and pushes it to GHCR with `vX.Y.Z`, `vX.Y`, and `latest`
-tags, in parallel with publishing wheel + sdist to PyPI via trusted
-publishing. ~3-5 minutes end-to-end.
+The workflow builds a multi-arch image (linux/amd64 + linux/arm64) and pushes it to GHCR with `vX.Y.Z`, `vX.Y`, and `latest` tags, in parallel with publishing wheel + sdist to PyPI via trusted publishing. ~3-5 minutes end-to-end.
+
+Don't have the helpers? Install once: `git clone https://github.com/ParkviewLab/dev-tools.git ~/dev-tools && cd ~/dev-tools && ./install.sh`.
