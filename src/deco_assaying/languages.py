@@ -167,12 +167,21 @@ def list_supported() -> list[dict[str, Any]]:
     return out
 
 
+# Languages whose tree-sitter grammar is GPL-licensed. We never load these so
+# tree-sitter-language-pack doesn't fetch the GPL grammar into the local cache
+# (which would create a GPL artifact alongside this MIT-licensed server).
+# Currently only `ebnf` (RubixDev/ebnf is GPL-3.0).
+_BLOCKED_LANGUAGES: frozenset[str] = frozenset({"ebnf"})
+
+
 @cache
 def get_parser(language: str):
     """Return a tree-sitter Parser for the given language id, or None.
 
     Cached per-process so the parser/grammar are reused across calls.
     """
+    if language in _BLOCKED_LANGUAGES:
+        return None
     try:
         from tree_sitter_language_pack import get_parser as _gp  # type: ignore[import-not-found]
     except Exception:
@@ -188,6 +197,8 @@ def get_parser(language: str):
 @cache
 def get_language(language: str):
     """Return a tree-sitter Language for the given language id, or None."""
+    if language in _BLOCKED_LANGUAGES:
+        return None
     try:
         from tree_sitter_language_pack import get_language as _gl  # type: ignore[import-not-found]
     except Exception:

@@ -32,3 +32,9 @@ def test_list_supported_includes_full_support_languages():
         assert required in listed
     fully = [row for row in languages.list_supported() if row["has_full_support"]]
     assert {row["id"] for row in fully} >= {"python", "typescript", "javascript"}
+
+
+def test_ebnf_grammar_is_blocked():
+    # ebnf is GPL-3.0 (RubixDev/ebnf) — must never be loaded by this MIT server.
+    assert languages.get_parser("ebnf") is None
+    assert languages.get_language("ebnf") is None
